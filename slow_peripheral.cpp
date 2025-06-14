@@ -1,5 +1,6 @@
 //  ────────────────────────────────────────────────────────────────────────────────
 //  SLOW Protocol ‒ Peripheral (versão COMPLETA corrigida)
+//
 //  • Flags remapeadas para que CONNECT gere 0x10000000 (10 00 00 00 em hex)
 //  • Campo STTL+FLAGS agora escrito/lido em endianness de rede (big‑endian)
 //  • Restante da lógica mantida do exemplo anterior
@@ -7,7 +8,7 @@
 
 #include <iostream>
 #include <vector>
-#include <map>git
+#include <map>
 #include <queue>
 #include <string>
 #include <cstring>
