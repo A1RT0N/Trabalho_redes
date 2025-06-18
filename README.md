@@ -1,4 +1,4 @@
 Como rodar:
 
-make all \
+make all 
 sudo ./slow_peripheral slow.gmelodie.com
