@@ -1,5 +1,5 @@
-// slow_peripheral.cpp (completo com revive implementado)
 #include <iostream>
+#include <iomanip>      
 #include <cstring>
 #include <string>
 #include <unistd.h>
@@ -13,13 +13,14 @@
 
 using namespace std;
 
-// Constantes
+// Cruzao, eu estive aqui 
+
 static const int HDR_SIZE = 32;
 static const int DATA_MAX = 1440;
-static const uint32_t FLAG_C   = 1 << 4;   // Connect flag
-static const uint32_t FLAG_R   = 1 << 3;   // Revive flag
-static const uint32_t FLAG_ACK = 1 << 2;   // Acknowledgment flag
-static const uint32_t FLAG_AR  = 1 << 1;   // Accept/Ready flag
+static const uint32_t FLAG_C   = 1 << 4;   
+static const uint32_t FLAG_R   = 1 << 3;  
+static const uint32_t FLAG_ACK = 1 << 2;   
+static const uint32_t FLAG_AR  = 1 << 1;  
 
 // Estrutura para identificador de sessão
 struct SID {
@@ -47,7 +48,7 @@ struct Header {
     Header() : sid(SID::nil()), sf(0), seq(0), ack(0), wnd(0), fid(0), fo(0) {}
 };
 
-// Funções para serialização de dados
+// Funções para (de)serialização
 void pack32(uint32_t v, uint8_t* p) {
     for (int i = 0; i < 4; i++) {
         p[i] = v & 0xFF;
@@ -78,18 +79,16 @@ uint16_t unpack16(const uint8_t* p) {
     return v;
 }
 
-// Serializa o cabeçalho para buffer
 void serialize(const Header& h, uint8_t* buf) {
     memcpy(buf, h.sid.b, 16);
-    pack32(h.sf, buf + 16);
-    pack32(h.seq, buf + 20);
-    pack32(h.ack, buf + 24);
-    pack16(h.wnd, buf + 28);
+    pack32(h.sf,      buf + 16);
+    pack32(h.seq,     buf + 20);
+    pack32(h.ack,     buf + 24);
+    pack16(h.wnd,     buf + 28);
     buf[30] = h.fid;
     buf[31] = h.fo;
 }
 
-// Deserializa o cabeçalho do buffer
 void deserialize(Header& h, const uint8_t* buf) {
     memcpy(h.sid.b, buf, 16);
     h.sf  = unpack32(buf + 16);
@@ -98,6 +97,31 @@ void deserialize(Header& h, const uint8_t* buf) {
     h.wnd = unpack16(buf + 28);
     h.fid = buf[30];
     h.fo  = buf[31];
+}
+
+// Função auxiliar para imprimir todos os campos de Header
+void printHeader(const Header& h, const std::string& label) {
+    cout << "---- " << label << " ----\n";
+    // SID em hex
+    cout << "SID: ";
+    for (int i = 0; i < 16; i++) {
+        cout << hex << setw(2) << setfill('0')
+             << static_cast<int>(h.sid.b[i]);
+    }
+    cout << dec << "\n";
+
+    // Flags (5 bits baixos) e STTL (27 bits altos)
+    uint32_t flags =  h.sf       & 0x1F;
+    uint32_t sttl  = (h.sf >> 5) & 0x07FFFFFF;
+    cout << "Flags: 0x" << hex << flags << dec
+         << " (" << flags << ")\n";
+    cout << "STTL: "   << sttl   << "\n";
+
+    cout << "SEQNUM: " << h.seq  << "\n";
+    cout << "ACKNUM: " << h.ack  << "\n";
+    cout << "WINDOW: " << h.wnd  << "\n";
+    cout << "FID: "    << static_cast<int>(h.fid) << "\n";
+    cout << "FO: "     << static_cast<int>(h.fo)  << "\n\n";
 }
 
 // Classe principal do periférico UDP
@@ -133,13 +157,25 @@ public:
         h.seq = nextSeq++;
         h.wnd = 5 * DATA_MAX;
         h.sf |= FLAG_C;
+
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
-        if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE) return false;
+
+        printHeader(h, "Pacote Enviado (CONNECT)");
+
+        if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
+            return false;
+
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
-        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE) return false;
-        Header r; deserialize(r, rbuf);
+        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+            return false;
+
+        Header r;
+        deserialize(r, rbuf);
+
+        printHeader(r, "Pacote Recebido (CONNECT)");
+
         if (r.ack != 0 || !(r.sf & FLAG_AR)) return false;
         prevHdr = r;
         hasPrev = true;
@@ -150,15 +186,54 @@ public:
 
     bool disconnect() {
         if (!active) return false;
+
+        // Prepara o pacote de DISCONNECT
         Header h = prevHdr;
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
-        h.sf = (h.sf & ~0x1F);  // limpa flags
-        uint8_t buf[HDR_SIZE]; serialize(h, buf);
-        if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE) return false;
-        active = false;
-        return true;
+        h.sf = (h.sf & ~0x1F) | FLAG_C | FLAG_R;
+
+        uint8_t buf[HDR_SIZE];
+        serialize(h, buf);
+        printHeader(h, "Pacote Enviado (DISCONNECT)");
+
+        if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
+            return false;
+
+        // Loop de tentativa de recepção do ACK
+        const int MAX_TRIES = 3;
+        for (int attempt = 1; attempt <= MAX_TRIES; ++attempt) {
+            uint8_t rbuf[HDR_SIZE];
+            sockaddr_in sa;
+            socklen_t sl = sizeof(sa);
+
+            ssize_t received = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
+            if (received >= HDR_SIZE) {
+                Header r;
+                deserialize(r, rbuf);
+                printHeader(r, "Pacote Recebido (DISCONNECT)");
+
+                if (r.sf & FLAG_ACK) {
+                    // ACK recebido com sucesso
+                    active = false;
+                    return true;
+                } else {
+                    cerr << "[AVISO] Pacote sem FLAG_ACK (tentativa " 
+                        << attempt << "/" << MAX_TRIES << ")\n";
+                }
+            } else {
+                cerr << "[AVISO] Sem resposta do servidor (tentativa " 
+                    << attempt << "/" << MAX_TRIES << ")\n";
+            }
+        }
+
+        // Desistiu após MAX_TRIES
+        cerr << "[ERRO] Não recebeu ACK de DISCONNECT após " 
+            << MAX_TRIES << " tentativas. Abortando.\n";
+        return false;
     }
+
+
 
     bool sendData(const string& msg) {
         if (!active || msg.size() > DATA_MAX) return false;
@@ -167,13 +242,26 @@ public:
         h.ack = lastCentralSeq;
         h.wnd = 5 * DATA_MAX;
         h.sf = (h.sf & ~0x1F);  // limpa flags para dados normais
+
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
+
+        printHeader(h, "Pacote Enviado (DATA)");
+
         memcpy(buf + HDR_SIZE, msg.data(), msg.size());
-        if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0) return false;
-        uint8_t rbuf[HDR_SIZE + DATA_MAX]; sockaddr_in sa; socklen_t sl = sizeof(sa);
-        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE) return false;
-        Header r; deserialize(r, rbuf);
+        if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+            return false;
+
+        uint8_t rbuf[HDR_SIZE + DATA_MAX];
+        sockaddr_in sa; socklen_t sl = sizeof(sa);
+        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+            return false;
+
+        Header r;
+        deserialize(r, rbuf);
+
+        printHeader(r, "Pacote Recebido (DATA)");
+
         if (!(r.sf & FLAG_ACK)) return false;
         lastCentralSeq = r.seq;
         prevHdr = r;
@@ -192,38 +280,34 @@ public:
     bool zeroWay(const string& msg) {
         if (fd < 0 || !hasPrev) return false;
         
-        // Constrói o cabeçalho de revive com dados
-        Header h = lastHdr;  // Usa os dados da sessão anterior armazenada
+        Header h = lastHdr;  
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
         h.wnd = 5 * DATA_MAX;
-        h.sf = (h.sf & ~0x1F) | FLAG_R;  // Limpa flags e adiciona flag R (revive)
+        h.sf = (h.sf & ~0x1F) | FLAG_R;  // Limpa flags e adiciona FLAG_R
         
-        // Prepara o buffer com cabeçalho + dados
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
+
+        printHeader(h, "Pacote Enviado (REVIVE)");
+
         memcpy(buf + HDR_SIZE, msg.data(), msg.size());
         size_t total = HDR_SIZE + msg.size();
+        if (sendto(fd, buf, total, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+            return false;
         
-        // Envia a requisição de revive com dados
-        if (sendto(fd, buf, total, 0, (sockaddr*)&srv, sizeof(srv)) < 0) return false;
-        
-        // Aguarda resposta ACK+AR
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
-        sockaddr_in sa; 
-        socklen_t sl = sizeof(sa);
+        sockaddr_in sa; socklen_t sl = sizeof(sa);
         ssize_t received = recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl);
-        
         if (received < HDR_SIZE) return false;
         
         Header r;
         deserialize(r, rbuf);
-        
-        // Verifica se é um ACK+AR válido para o revive
-        if ((r.sf & FLAG_ACK) && (r.sf & FLAG_AR) && 
+
+        printHeader(r, "Pacote Recebido (REVIVE)");
+
+        if ((r.sf & FLAG_ACK) && (r.sf & FLAG_AR) &&
             r.sid.isEqual(lastHdr.sid) && r.ack == h.seq) {
-            
-            // Sessão revivida com sucesso
             prevHdr = r;
             active = true;
             lastCentralSeq = r.seq;
@@ -234,7 +318,7 @@ public:
     }
 };
 
-// Funções auxiliares para interface
+// Interface de usuário (sem alterações)
 void printWelcome() {
     cout << "\n=================================================\n";
     cout << "         UDP Peripheral Client v1.0              \n";
@@ -302,16 +386,13 @@ int main() {
     UDPPeripheral p;
     bool connected = false;
 
-    // Inicialização
     if (!p.init("slow.gmelodie.com", 7033)) {
         cerr << "[ERRO] Falha na inicialização da rede!\n";
-        cerr << "       Verifique sua conexão com a internet.\n";
         return 1;
     }
 
     if (!p.connect()) {
         cerr << "[ERRO] Falha na conexão com o servidor!\n";
-        cerr << "       O servidor pode estar indisponível.\n";
         return 1;
     }
 
@@ -322,30 +403,21 @@ int main() {
     while (true) {
         printMenu();
         cout << "\n> Digite sua opção: ";
-
-        if (!(cin >> cmd)) {
-            cout << "\n[ERRO] Erro na leitura da entrada. Encerrando...\n";
-            break;
-        }
-
+        if (!(cin >> cmd)) break;
         cmd = toLowerCase(cmd);
         cout << "\n";
 
         if (cmd == "1" || cmd == "data") {
             if (!connected) {
                 cout << "[ERRO] Não há conexão ativa!\n";
-                cout << "       Use 'revive' para restaurar uma sessão anterior.\n";
                 continue;
             }
-
             cin.ignore();
             string message = getInput("Digite sua mensagem: ");
-
             if (message.empty()) {
                 cout << "[AVISO] Mensagem vazia não enviada.\n";
                 continue;
             }
-
             cout << "Enviando mensagem...\n";
             if (p.sendData(message)) {
                 cout << "[OK] Mensagem enviada com sucesso!\n";
@@ -358,10 +430,7 @@ int main() {
                 cout << "[AVISO] Já está desconectado.\n";
                 continue;
             }
-
-            // Antes de desconectar, armazena sessão para revive
             p.storeSession();
-
             cout << "Desconectando do servidor...\n";
             if (p.disconnect()) {
                 cout << "[OK] Desconectado com sucesso!\n";
@@ -375,32 +444,22 @@ int main() {
                 cout << "[AVISO] Já está conectado. Use 'disconnect' primeiro.\n";
                 continue;
             }
-
             if (!p.canRevive()) {
                 cout << "[ERRO] Nenhuma sessão anterior disponível!\n";
-                cout << "       Use um cliente novo para estabelecer conexão.\n";
                 continue;
             }
-
             cout << "Tentando reviver sessão...\n";
-
-            // Solicita mensagem para enviar junto com o revive
             cin.ignore();
             string reviveMessage = getInput("Digite uma mensagem para enviar com o revive: ");
-            
             if (reviveMessage.empty()) {
                 reviveMessage = "Revive test message";
                 cout << "[INFO] Usando mensagem padrão: \"" << reviveMessage << "\"\n";
             }
-
-            // Tenta fazer o revive da sessão
             if (p.zeroWay(reviveMessage)) {
                 cout << "[OK] Sessão revivida com sucesso!\n";
-                cout << "     Mensagem enviada junto com o revive.\n";
                 connected = true;
             } else {
                 cout << "[ERRO] Falha ao reviver a sessão.\n";
-                cout << "       A sessão pode ter expirado no servidor.\n";
             }
 
         } else if (cmd == "4" || cmd == "status") {
@@ -410,7 +469,6 @@ int main() {
             printHelp();
 
         } else if (cmd == "6" || cmd == "exit" || cmd == "quit" || cmd == "end") {
-            // Se estiver conectado, salva e desconecta antes de sair
             if (connected) {
                 p.storeSession();
                 p.disconnect();
