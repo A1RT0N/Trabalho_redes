@@ -3,6 +3,7 @@ Ayrton da Costa Ganem Filho - 14560190
 Luiz Felipe Diniz Costa - 13782032
 Cauê Paiva Lira - 14675416
 */
+
 #include <iostream>
 #include <iomanip>      
 #include <cstring>
@@ -18,41 +19,63 @@ Cauê Paiva Lira - 14675416
 
 using namespace std;
 
+// Tamanho fixo do cabeçalho e payload máximo
 static const int   HDR_SIZE = 32;
 static const int   DATA_MAX = 1440;
-static const uint32_t FLAG_C   = 1 << 4;   // Connect
-static const uint32_t FLAG_R   = 1 << 3;   // Revive / Disconnect
-static const uint32_t FLAG_ACK = 1 << 2;   // Ack
-static const uint32_t FLAG_AR  = 1 << 1;   // Accept/Ready
-static const uint32_t FLAG_MB  = 1 << 0;   // More Bits (fragmentation)
 
+// Flags usadas no campo sf (5 bits menos significativos)
+static const uint32_t FLAG_C   = 1 << 4;   ///< Conectar
+static const uint32_t FLAG_R   = 1 << 3;   ///< Reviver / Desconectar
+static const uint32_t FLAG_ACK = 1 << 2;   ///< Reconhecimento (Ack)
+static const uint32_t FLAG_AR  = 1 << 1;   ///< Aceitar/Pronto
+static const uint32_t FLAG_MB  = 1 << 0;   ///< Mais Bits (fragmentação)
 
-// Estrutura para identificador de sessão
+/**
+ * @struct SID
+ * @brief Identificador de sessão (16 bytes).
+ */
 struct SID {
-    uint8_t b[16];
+    uint8_t b[16];              ///< Bytes do ID
+
+    /**
+     * @brief Retorna um SID nulo (zeros).
+     */
     static SID nil() {
         SID s{};
         memset(s.b, 0, 16);
         return s;
     }
+
+    /**
+     * @brief Compara igualdade de SIDs.
+     * @param o Outro SID para comparação
+     * @return true se bytes forem idênticos
+     */
     bool isEqual(const SID& o) const {
         return memcmp(b, o.b, 16) == 0;
     }
 };
 
-// Estrutura do cabeçalho do protocolo
+/**
+ * @struct Header
+ * @brief Representa o cabeçalho do protocolo SLOW.
+ */
 struct Header {
-    SID     sid;   // 16 bytes
-    uint32_t sf;   // STTL (27 bits) | flags (5 bits)
-    uint32_t seq;  // sequence number
-    uint32_t ack;  // acknowledgment number
-    uint16_t wnd;  // window size
-    uint8_t  fid;  // fragment ID
-    uint8_t  fo;   // fragment offset
+    SID     sid;   ///< ID da Sessão (16 bytes)
+    uint32_t sf;   ///< STTL (27 bits) | flags (5 bits)
+    uint32_t seq;  ///< Número de sequência
+    uint32_t ack;  ///< Número de reconhecimento (ACK)
+    uint16_t wnd;  ///< Tamanho da janela
+    uint8_t  fid;  ///< ID do fragmento
+    uint8_t  fo;   ///< Offset do fragmento
+
+    /**
+     * @brief Construtor padrão zera todos os campos.
+     */
     Header(): sid(SID::nil()), sf(0), seq(0), ack(0), wnd(0), fid(0), fo(0) {}
 };
 
-// (de)serialização little-endian
+// Funções de (de)serialização little-endian para inteiros
 void pack32(uint32_t v, uint8_t* p) {
     for (int i = 0; i < 4; i++) {
         p[i] = v & 0xFF;
@@ -78,6 +101,9 @@ uint16_t unpack16(const uint8_t* p) {
     return v;
 }
 
+/**
+ * @brief Serializa um Header em buffer de bytes.
+ */
 void serialize(const Header& h, uint8_t* buf) {
     memcpy(buf,       h.sid.b, 16);
     pack32(h.sf,     buf + 16);
@@ -87,6 +113,10 @@ void serialize(const Header& h, uint8_t* buf) {
     buf[30] = h.fid;
     buf[31] = h.fo;
 }
+
+/**
+ * @brief Desserializa bytes em um Header.
+ */
 void deserialize(Header& h, const uint8_t* buf) {
     memcpy(h.sid.b, buf, 16);
     h.sf  = unpack32(buf + 16);
@@ -97,7 +127,11 @@ void deserialize(Header& h, const uint8_t* buf) {
     h.fo  = buf[31];
 }
 
-// imprime todos os campos
+/**
+ * @brief Imprime todos os campos de um Header (hex e dec).
+ * @param h Header a ser impresso
+ * @param label Rótulo para identificação
+ */
 void printHeader(const Header& h, const string& label) {
     cout << "---- " << label << " ----\n";
     cout << "SID: ";
@@ -115,23 +149,33 @@ void printHeader(const Header& h, const string& label) {
     cout << "FO: "      << (int)h.fo  << "\n\n";
 }
 
-// Classe principal
+/**
+ * @class UDPPeripheral
+ * @brief Gerencia socket UDP e implementa lógica do protocolo SLOW.
+ */
 class UDPPeripheral {
 private:
-    int        fd;
-    sockaddr_in srv;
-    Header     lastHdr, prevHdr;
-    bool       active         = false;
-    bool       hasPrev        = false;
-    uint32_t   nextSeq        = 0;
-    uint32_t   lastCentralSeq = 0;
-    uint32_t   window_size    = 5 * DATA_MAX;  // janela inicial
-    uint32_t   bytesInFlight  = 0;             // bytes enviados e não ACKed
+    int        fd;              ///< File descriptor do socket
+    sockaddr_in srv;            ///< Endereço do servidor
+    Header     lastHdr;         ///< Último header armazenado
+    Header     prevHdr;         ///< Header da última troca bem-sucedida
+    bool       active    = false; ///< Conexão ativa?
+    bool       hasPrev   = false; ///< Replay possível?
+    uint32_t   nextSeq   = 0;     ///< Próximo sequence number
+    uint32_t   lastCentralSeq = 0;///< Último seq do servidor
+    uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
+    uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
 
 public:
     UDPPeripheral(): fd(-1) {}
     ~UDPPeripheral() { if (fd >= 0) close(fd); }
 
+    /**
+     * @brief Inicializa socket e configuração do servidor.
+     * @param host IP ou hostname
+     * @param port Porta UDP
+     * @return true em sucesso, false caso contrário
+     */
     bool init(const char* host, int port) {
         if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) return false;
         hostent* he = gethostbyname(host);
@@ -145,8 +189,11 @@ public:
         return true;
     }
 
+    /**
+     * @brief Realiza handshake CONNECT→SETUP→ACK.
+     */
     bool connect() {
-        // 1) CONNECT
+        // 1) Envia CONNECT
         Header h;
         h.seq = nextSeq++;
         h.wnd = window_size;
@@ -159,7 +206,7 @@ public:
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
-        // 2) SETUP
+        // 2) Recebe SETUP
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
@@ -172,7 +219,7 @@ public:
         if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
-        // 3) guarda estado e janela dinâmica
+        // 3) Atualiza estado
         prevHdr        = r;
         hasPrev        = true;
         active         = true;
@@ -182,6 +229,9 @@ public:
         return true;
     }
 
+    /**
+     * @brief Encerra sessão com CONNECT+REVIVE+ACK.
+     */
     bool disconnect() {
         if (!active) return false;
 
@@ -215,10 +265,13 @@ public:
         return false;
     }
 
+    /**
+     * @brief Envia mensagem (com fragmentação se > DATA_MAX).
+     */
     bool sendData(const string& msg) {
         if (!active) return false;
 
-        // fragmentação se necessário
+        // Fragmentado
         if (msg.size() > DATA_MAX) {
             uint8_t fragment_id = nextSeq & 0xFF;
             size_t offset = 0;
@@ -227,7 +280,6 @@ public:
             while (offset < msg.size()) {
                 size_t chunk = min(msg.size() - offset, (size_t)DATA_MAX);
 
-                // controle de janela
                 if (bytesInFlight + chunk > window_size) {
                     cerr << "[ERRO] Janela cheia ("
                          << bytesInFlight << "+" << chunk
@@ -258,8 +310,8 @@ public:
 
                 offset += chunk;
             }
-
-            // aguarda ACK único do último fragmento
+            
+            // Espera ACK final
             uint8_t rbuf[HDR_SIZE];
             sockaddr_in sa; socklen_t sl = sizeof(sa);
             if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
@@ -269,7 +321,6 @@ public:
             printHeader(r, "Pacote Recebido (DATA final)");
             if (!(r.sf & FLAG_ACK)) return false;
 
-            // libera janela e atualiza estado
             bytesInFlight   = 0;
             window_size     = r.wnd;
             lastCentralSeq  = r.seq;
@@ -280,7 +331,6 @@ public:
         // sem fragmento
         size_t payloadSize = msg.size();
 
-        // controle de janela
         if (bytesInFlight + payloadSize > window_size) {
             cerr << "[ERRO] Janela cheia ("
                  << bytesInFlight << "+" << payloadSize
@@ -321,14 +371,24 @@ public:
         return true;
     }
 
+    /**
+     * @brief Armazena sessão atual para revive futuro.
+     */
     void storeSession() {
         if (active) {
             lastHdr = prevHdr;
             hasPrev = true;
         }
     }
+
+    /**
+     * @brief Indica se há sessão para revive.
+     */
     bool canRevive() const { return hasPrev; }
 
+    /**
+     * @brief Retoma sessão sem handshake completo (zero-way).
+     */
     bool zeroWay(const string& msg) {
         if (!hasPrev) return false;
 
@@ -369,7 +429,10 @@ public:
 };
 
 
-// Interface de usuário (sem alterações)
+
+// ---------------------- Interação com usuário ----------------------
+
+
 void printWelcome() {
     cout << "\n=================================================\n";
     cout << "         UDP Peripheral Client v1.0              \n";
@@ -430,7 +493,9 @@ string getInput(const string& prompt) {
     return input;
 }
 
-// Função principal
+/**
+ * @brief Função principal: gerencia loop de comandos interativos.
+ */
 int main() {
     printWelcome();
 
