@@ -174,15 +174,36 @@ public:
         Header r;
         deserialize(r, rbuf);
 
-        printHeader(r, "Pacote Recebido (CONNECT)");
+        printHeader(r, "Pacote Recebido (SETUP)");
 
         if (r.ack != 0 || !(r.sf & FLAG_AR)) return false;
+
+        // Guarda estado da sessão
         prevHdr = r;
         hasPrev = true;
         active = true;
         lastCentralSeq = r.seq;
+
+        // **Envia um ACK final ao servidor para confirmar o setup**
+        Header ackH;
+        ackH.sid = r.sid;                     // mesma sessão
+        ackH.seq = nextSeq++;                 // nosso próximo seq
+        ackH.ack = r.seq;                     // confirmamos o seq do servidor
+        ackH.wnd = 5 * DATA_MAX;              // janela
+        ackH.sf = FLAG_ACK;                   // só flag ACK
+
+        uint8_t ackBuf[HDR_SIZE];
+        serialize(ackH, ackBuf);
+
+        printHeader(ackH, "Pacote Enviado (ACK)");
+
+        if (sendto(fd, ackBuf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
+            return false;
+
         return true;
     }
+
+
 
     bool disconnect() {
         if (!active) return false;
@@ -306,16 +327,16 @@ public:
 
         printHeader(r, "Pacote Recebido (REVIVE)");
 
-        if ((r.sf & FLAG_ACK) && (r.sf & FLAG_AR) &&
-            r.sid.isEqual(lastHdr.sid) && r.ack == h.seq) {
-            prevHdr = r;
-            active = true;
-            lastCentralSeq = r.seq;
-            return true;
-        }
         
-        return false;
+        prevHdr = r;
+        active = true;
+        lastCentralSeq = r.seq;
+            
+        return true;  
+        
     }
+
+
 };
 
 // Interface de usuário (sem alterações)
