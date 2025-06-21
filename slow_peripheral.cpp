@@ -1,3 +1,9 @@
+/*
+Ayrton da Costa Ganem Filho - 14560190
+Luiz Felipe Diniz Costa - 13782032
+Cauê Paiva Lira - 14675416
+*/
+
 #include <iostream>
 #include <iomanip>      
 #include <cstring>
@@ -13,14 +19,14 @@
 
 using namespace std;
 
-// Cruzao, eu estive aqui 
+static const int   HDR_SIZE = 32;
+static const int   DATA_MAX = 1440;
+static const uint32_t FLAG_C   = 1 << 4;   // Connect
+static const uint32_t FLAG_R   = 1 << 3;   // Revive / Disconnect
+static const uint32_t FLAG_ACK = 1 << 2;   // Ack
+static const uint32_t FLAG_AR  = 1 << 1;   // Accept/Ready
+static const uint32_t FLAG_MB  = 1 << 0;   // More Bits (fragmentation)
 
-static const int HDR_SIZE = 32;
-static const int DATA_MAX = 1440;
-static const uint32_t FLAG_C   = 1 << 4;   
-static const uint32_t FLAG_R   = 1 << 3;  
-static const uint32_t FLAG_ACK = 1 << 2;   
-static const uint32_t FLAG_AR  = 1 << 1;  
 
 // Estrutura para identificador de sessão
 struct SID {
@@ -30,65 +36,58 @@ struct SID {
         memset(s.b, 0, 16);
         return s;
     }
-    
-    bool isEqual(const SID& other) const {
-        return memcmp(b, other.b, 16) == 0;
+    bool isEqual(const SID& o) const {
+        return memcmp(b, o.b, 16) == 0;
     }
 };
 
 // Estrutura do cabeçalho do protocolo
 struct Header {
-    SID sid;         // Session ID
-    uint32_t sf;     // STTL (upper 27 bits) + flags (lower 5 bits)
-    uint32_t seq;    // Sequence number
-    uint32_t ack;    // Acknowledgment number
-    uint16_t wnd;    // Window size
-    uint8_t fid;     // Fragment ID
-    uint8_t fo;      // Fragment offset
-    Header() : sid(SID::nil()), sf(0), seq(0), ack(0), wnd(0), fid(0), fo(0) {}
+    SID     sid;   // 16 bytes
+    uint32_t sf;   // STTL (27 bits) | flags (5 bits)
+    uint32_t seq;  // sequence number
+    uint32_t ack;  // acknowledgment number
+    uint16_t wnd;  // window size
+    uint8_t  fid;  // fragment ID
+    uint8_t  fo;   // fragment offset
+    Header(): sid(SID::nil()), sf(0), seq(0), ack(0), wnd(0), fid(0), fo(0) {}
 };
 
-// Funções para (de)serialização
+// (de)serialização little-endian
 void pack32(uint32_t v, uint8_t* p) {
     for (int i = 0; i < 4; i++) {
         p[i] = v & 0xFF;
         v >>= 8;
     }
 }
-
 uint32_t unpack32(const uint8_t* p) {
     uint32_t v = 0;
-    for (int i = 0; i < 4; i++) {
-        v |= p[i] << (i * 8);
-    }
+    for (int i = 0; i < 4; i++)
+        v |= (uint32_t)p[i] << (i*8);
     return v;
 }
-
 void pack16(uint16_t v, uint8_t* p) {
     for (int i = 0; i < 2; i++) {
         p[i] = v & 0xFF;
         v >>= 8;
     }
 }
-
 uint16_t unpack16(const uint8_t* p) {
     uint16_t v = 0;
-    for (int i = 0; i < 2; i++) {
-        v |= p[i] << (i * 8);
-    }
+    for (int i = 0; i < 2; i++)
+        v |= (uint16_t)p[i] << (i*8);
     return v;
 }
 
 void serialize(const Header& h, uint8_t* buf) {
     memcpy(buf, h.sid.b, 16);
-    pack32(h.sf,      buf + 16);
-    pack32(h.seq,     buf + 20);
-    pack32(h.ack,     buf + 24);
-    pack16(h.wnd,     buf + 28);
+    pack32(h.sf,  buf + 16);
+    pack32(h.seq, buf + 20);
+    pack32(h.ack, buf + 24);
+    pack16(h.wnd, buf + 28);
     buf[30] = h.fid;
     buf[31] = h.fo;
 }
-
 void deserialize(Header& h, const uint8_t* buf) {
     memcpy(h.sid.b, buf, 16);
     h.sf  = unpack32(buf + 16);
@@ -99,44 +98,38 @@ void deserialize(Header& h, const uint8_t* buf) {
     h.fo  = buf[31];
 }
 
-// Função auxiliar para imprimir todos os campos de Header
-void printHeader(const Header& h, const std::string& label) {
+// imprime todos os campos
+void printHeader(const Header& h, const string& label) {
     cout << "---- " << label << " ----\n";
-    // SID em hex
     cout << "SID: ";
-    for (int i = 0; i < 16; i++) {
-        cout << hex << setw(2) << setfill('0')
-             << static_cast<int>(h.sid.b[i]);
-    }
+    for (int i = 0; i < 16; i++)
+        cout << hex << setw(2) << setfill('0') << (int)h.sid.b[i];
     cout << dec << "\n";
-
-    // Flags (5 bits baixos) e STTL (27 bits altos)
-    uint32_t flags =  h.sf       & 0x1F;
+    uint32_t flags =  h.sf & 0x1F;
     uint32_t sttl  = (h.sf >> 5) & 0x07FFFFFF;
-    cout << "Flags: 0x" << hex << flags << dec
-         << " (" << flags << ")\n";
-    cout << "STTL: "   << sttl   << "\n";
-
-    cout << "SEQNUM: " << h.seq  << "\n";
-    cout << "ACKNUM: " << h.ack  << "\n";
-    cout << "WINDOW: " << h.wnd  << "\n";
-    cout << "FID: "    << static_cast<int>(h.fid) << "\n";
-    cout << "FO: "     << static_cast<int>(h.fo)  << "\n\n";
+    cout << "Flags: 0x" << hex << flags << dec << " ("<<flags<<")\n";
+    cout << "STTL: "    << sttl  << "\n";
+    cout << "SEQNUM: "  << h.seq  << "\n";
+    cout << "ACKNUM: "  << h.ack  << "\n";
+    cout << "WINDOW: "  << h.wnd  << "\n";
+    cout << "FID: "     << (int)h.fid << "\n";
+    cout << "FO: "      << (int)h.fo  << "\n\n";
 }
 
-// Classe principal do periférico UDP
+// Classe principal
 class UDPPeripheral {
 private:
-    int fd;
+    int        fd;
     sockaddr_in srv;
-    Header lastHdr, prevHdr;
-    bool active = false;
-    bool hasPrev = false;
-    uint32_t nextSeq = 0;
-    uint32_t lastCentralSeq = 0;
+    Header     lastHdr, prevHdr;
+    bool       active       = false;
+    bool       hasPrev      = false;
+    uint32_t   nextSeq      = 0;
+    uint32_t   lastCentralSeq = 0;
+    uint32_t   window_size  = 5 * DATA_MAX;  // janela inicial
 
 public:
-    UDPPeripheral() : fd(-1) {}
+    UDPPeripheral(): fd(-1) {}
     ~UDPPeripheral() { if (fd >= 0) close(fd); }
 
     bool init(const char* host, int port) {
@@ -153,19 +146,20 @@ public:
     }
 
     bool connect() {
+        // 1) CONNECT
         Header h;
         h.seq = nextSeq++;
-        h.wnd = 5 * DATA_MAX;
+        h.wnd = window_size;
         h.sf |= FLAG_C;
 
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
-
         printHeader(h, "Pacote Enviado (CONNECT)");
 
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
+        // 2) SETUP
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
@@ -173,46 +167,30 @@ public:
 
         Header r;
         deserialize(r, rbuf);
-
         printHeader(r, "Pacote Recebido (SETUP)");
 
-        if (r.ack != 0 || !(r.sf & FLAG_AR)) return false;
-
-        // Guarda estado da sessão
-        prevHdr = r;
-        hasPrev = true;
-        active = true;
-        lastCentralSeq = r.seq;
-
-        // **Envia um ACK final ao servidor para confirmar o setup**
-        Header ackH;
-        ackH.sid = r.sid;                     // mesma sessão
-        ackH.seq = nextSeq++;                 // nosso próximo seq
-        ackH.ack = r.seq;                     // confirmamos o seq do servidor
-        ackH.wnd = 5 * DATA_MAX;              // janela
-        ackH.sf = FLAG_ACK;                   // só flag ACK
-
-        uint8_t ackBuf[HDR_SIZE];
-        serialize(ackH, ackBuf);
-
-        printHeader(ackH, "Pacote Enviado (ACK)");
-
-        if (sendto(fd, ackBuf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
+        if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
+        // 3) guarda estado e janela dinâmica
+        prevHdr        = r;
+        hasPrev        = true;
+        active         = true;
+        lastCentralSeq = r.seq;
+        window_size    = r.wnd;
+
+        // não enviamos mais ACK puro aqui
         return true;
     }
-
-
 
     bool disconnect() {
         if (!active) return false;
 
-        // Prepara o pacote de DISCONNECT
         Header h = prevHdr;
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
-        h.sf = (h.sf & ~0x1F) | FLAG_C | FLAG_R;
+        h.wnd = 0;
+        h.sf = (h.sf & ~0x1F) | FLAG_C | FLAG_R | FLAG_ACK;
 
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
@@ -221,55 +199,69 @@ public:
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
-        // Loop de tentativa de recepção do ACK
         const int MAX_TRIES = 3;
-        for (int attempt = 1; attempt <= MAX_TRIES; ++attempt) {
+        for (int i = 1; i <= MAX_TRIES; ++i) {
             uint8_t rbuf[HDR_SIZE];
-            sockaddr_in sa;
-            socklen_t sl = sizeof(sa);
-
-            ssize_t received = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
-            if (received >= HDR_SIZE) {
-                Header r;
-                deserialize(r, rbuf);
-                printHeader(r, "Pacote Recebido (DISCONNECT)");
-
-                if (r.sf & FLAG_ACK) {
-                    // ACK recebido com sucesso
+            sockaddr_in sa; socklen_t sl = sizeof(sa);
+            ssize_t rec = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
+            if (rec >= HDR_SIZE) {
+                Header rr; deserialize(rr, rbuf);
+                printHeader(rr, "Pacote Recebido (DISCONNECT)");
+                if (rr.sf & FLAG_ACK) {
                     active = false;
                     return true;
-                } else {
-                    cerr << "[AVISO] Pacote sem FLAG_ACK (tentativa " 
-                        << attempt << "/" << MAX_TRIES << ")\n";
                 }
-            } else {
-                cerr << "[AVISO] Sem resposta do servidor (tentativa " 
-                    << attempt << "/" << MAX_TRIES << ")\n";
             }
         }
-
-        // Desistiu após MAX_TRIES
-        cerr << "[ERRO] Não recebeu ACK de DISCONNECT após " 
-            << MAX_TRIES << " tentativas. Abortando.\n";
         return false;
     }
 
-
-
     bool sendData(const string& msg) {
-        if (!active || msg.size() > DATA_MAX) return false;
+        if (!active) return false;
+
+        // fragmentação se necessário
+        if (msg.size() > DATA_MAX) {
+            uint16_t fid = 1;
+            size_t offset = 0;
+            while (offset < msg.size()) {
+                size_t chunk = min(msg.size() - offset, (size_t)DATA_MAX);
+                Header h = prevHdr;
+                h.seq = nextSeq++;
+                h.ack = lastCentralSeq;
+                h.wnd = window_size;
+
+                uint32_t f = FLAG_ACK;
+                if (offset + chunk < msg.size()) f |= FLAG_MB;
+                h.sf = (h.sf & ~0x1F) | f;
+
+                h.fid = fid++;
+                h.fo  = fid - 1;
+
+                uint8_t buf[HDR_SIZE + DATA_MAX];
+                serialize(h, buf);
+                memcpy(buf + HDR_SIZE, msg.data() + offset, chunk);
+                printHeader(h, "Pacote Enviado (DATA fragmentado)");
+
+                if (sendto(fd, buf, HDR_SIZE + chunk, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+                    return false;
+
+                offset += chunk;
+            }
+            return true;
+        }
+
+        // sem fragmento
         Header h = prevHdr;
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
-        h.wnd = 5 * DATA_MAX;
-        h.sf = (h.sf & ~0x1F);  // limpa flags para dados normais
+        h.wnd = window_size;
+        h.sf  = (h.sf & ~0x1F) | FLAG_ACK;
 
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
-
+        memcpy(buf + HDR_SIZE, msg.data(), msg.size());
         printHeader(h, "Pacote Enviado (DATA)");
 
-        memcpy(buf + HDR_SIZE, msg.data(), msg.size());
         if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0)
             return false;
 
@@ -278,14 +270,12 @@ public:
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
             return false;
 
-        Header r;
-        deserialize(r, rbuf);
-
+        Header r; deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (DATA)");
 
         if (!(r.sf & FLAG_ACK)) return false;
         lastCentralSeq = r.seq;
-        prevHdr = r;
+        prevHdr        = r;
         return true;
     }
 
@@ -295,49 +285,46 @@ public:
             hasPrev = true;
         }
     }
-
     bool canRevive() const { return hasPrev; }
 
     bool zeroWay(const string& msg) {
-        if (fd < 0 || !hasPrev) return false;
-        
-        Header h = lastHdr;  
+        if (!hasPrev) return false;
+
+        Header h = lastHdr;
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
-        h.wnd = 5 * DATA_MAX;
-        h.sf = (h.sf & ~0x1F) | FLAG_R;  // Limpa flags e adiciona FLAG_R
-        
+        h.wnd = window_size;
+        h.sf  = (h.sf & ~0x1F) | FLAG_R | FLAG_ACK;
+
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
-
+        memcpy(buf + HDR_SIZE, msg.data(), msg.size());
         printHeader(h, "Pacote Enviado (REVIVE)");
 
-        memcpy(buf + HDR_SIZE, msg.data(), msg.size());
-        size_t total = HDR_SIZE + msg.size();
-        if (sendto(fd, buf, total, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+        if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0)
             return false;
-        
+
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
-        ssize_t received = recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl);
-        if (received < HDR_SIZE) return false;
-        
-        Header r;
-        deserialize(r, rbuf);
+        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+            return false;
 
+        Header r; deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (REVIVE)");
 
-        
-        prevHdr = r;
-        active = true;
+        // validação do bit A/R
+        if (!(r.sf & FLAG_AR)) {
+            cerr << "[ERRO] Revive rejeitado pelo servidor (A/R=0)\n";
+            return false;
+        }
+
+        prevHdr        = r;
+        active         = true;
         lastCentralSeq = r.seq;
-            
-        return true;  
-        
+        return true;
     }
-
-
 };
+
 
 // Interface de usuário (sem alterações)
 void printWelcome() {
