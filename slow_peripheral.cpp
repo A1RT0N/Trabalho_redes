@@ -3,7 +3,6 @@ Ayrton da Costa Ganem Filho - 14560190
 Luiz Felipe Diniz Costa - 13782032
 Cauê Paiva Lira - 14675416
 */
-
 #include <iostream>
 #include <iomanip>      
 #include <cstring>
@@ -80,11 +79,11 @@ uint16_t unpack16(const uint8_t* p) {
 }
 
 void serialize(const Header& h, uint8_t* buf) {
-    memcpy(buf, h.sid.b, 16);
-    pack32(h.sf,  buf + 16);
-    pack32(h.seq, buf + 20);
-    pack32(h.ack, buf + 24);
-    pack16(h.wnd, buf + 28);
+    memcpy(buf,       h.sid.b, 16);
+    pack32(h.sf,     buf + 16);
+    pack32(h.seq,    buf + 20);
+    pack32(h.ack,    buf + 24);
+    pack16(h.wnd,    buf + 28);
     buf[30] = h.fid;
     buf[31] = h.fo;
 }
@@ -122,11 +121,12 @@ private:
     int        fd;
     sockaddr_in srv;
     Header     lastHdr, prevHdr;
-    bool       active       = false;
-    bool       hasPrev      = false;
-    uint32_t   nextSeq      = 0;
+    bool       active         = false;
+    bool       hasPrev        = false;
+    uint32_t   nextSeq        = 0;
     uint32_t   lastCentralSeq = 0;
-    uint32_t   window_size  = 5 * DATA_MAX;  // janela inicial
+    uint32_t   window_size    = 5 * DATA_MAX;  // janela inicial
+    uint32_t   bytesInFlight  = 0;             // bytes enviados e não ACKed
 
 public:
     UDPPeripheral(): fd(-1) {}
@@ -179,7 +179,6 @@ public:
         lastCentralSeq = r.seq;
         window_size    = r.wnd;
 
-        // não enviamos mais ACK puro aqui
         return true;
     }
 
@@ -190,7 +189,7 @@ public:
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
         h.wnd = 0;
-        h.sf = (h.sf & ~0x1F) | FLAG_C | FLAG_R | FLAG_ACK;
+        h.sf  = (h.sf & ~0x1F) | FLAG_C | FLAG_R | FLAG_ACK;
 
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
@@ -221,10 +220,22 @@ public:
 
         // fragmentação se necessário
         if (msg.size() > DATA_MAX) {
-            uint16_t fid = 1;
+            uint8_t fragment_id = nextSeq & 0xFF;
             size_t offset = 0;
+            uint8_t fo = 0;
+
             while (offset < msg.size()) {
                 size_t chunk = min(msg.size() - offset, (size_t)DATA_MAX);
+
+                // controle de janela
+                if (bytesInFlight + chunk > window_size) {
+                    cerr << "[ERRO] Janela cheia ("
+                         << bytesInFlight << "+" << chunk
+                         << " > " << window_size
+                         << "), aguarde ACK.\n";
+                    return false;
+                }
+
                 Header h = prevHdr;
                 h.seq = nextSeq++;
                 h.ack = lastCentralSeq;
@@ -232,25 +243,52 @@ public:
 
                 uint32_t f = FLAG_ACK;
                 if (offset + chunk < msg.size()) f |= FLAG_MB;
-                h.sf = (h.sf & ~0x1F) | f;
-
-                h.fid = fid++;
-                h.fo  = fid - 1;
+                h.sf  = (h.sf & ~0x1F) | f;
+                h.fid = fragment_id;
+                h.fo  = fo++;
 
                 uint8_t buf[HDR_SIZE + DATA_MAX];
                 serialize(h, buf);
                 memcpy(buf + HDR_SIZE, msg.data() + offset, chunk);
                 printHeader(h, "Pacote Enviado (DATA fragmentado)");
 
+                bytesInFlight += chunk;
                 if (sendto(fd, buf, HDR_SIZE + chunk, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
                     return false;
 
                 offset += chunk;
             }
+
+            // aguarda ACK único do último fragmento
+            uint8_t rbuf[HDR_SIZE];
+            sockaddr_in sa; socklen_t sl = sizeof(sa);
+            if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+                return false;
+
+            Header r; deserialize(r, rbuf);
+            printHeader(r, "Pacote Recebido (DATA final)");
+            if (!(r.sf & FLAG_ACK)) return false;
+
+            // libera janela e atualiza estado
+            bytesInFlight   = 0;
+            window_size     = r.wnd;
+            lastCentralSeq  = r.seq;
+            prevHdr         = r;
             return true;
         }
 
         // sem fragmento
+        size_t payloadSize = msg.size();
+
+        // controle de janela
+        if (bytesInFlight + payloadSize > window_size) {
+            cerr << "[ERRO] Janela cheia ("
+                 << bytesInFlight << "+" << payloadSize
+                 << " > " << window_size
+                 << "), aguarde ACK.\n";
+            return false;
+        }
+
         Header h = prevHdr;
         h.seq = nextSeq++;
         h.ack = lastCentralSeq;
@@ -259,10 +297,11 @@ public:
 
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
-        memcpy(buf + HDR_SIZE, msg.data(), msg.size());
+        memcpy(buf + HDR_SIZE, msg.data(), payloadSize);
         printHeader(h, "Pacote Enviado (DATA)");
 
-        if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+        bytesInFlight += payloadSize;
+        if (sendto(fd, buf, HDR_SIZE + payloadSize, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
             return false;
 
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
@@ -272,10 +311,13 @@ public:
 
         Header r; deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (DATA)");
-
         if (!(r.sf & FLAG_ACK)) return false;
-        lastCentralSeq = r.seq;
-        prevHdr        = r;
+
+        // libera janela e atualiza estado
+        bytesInFlight   = 0;
+        window_size     = r.wnd;
+        lastCentralSeq  = r.seq;
+        prevHdr         = r;
         return true;
     }
 
@@ -309,7 +351,8 @@ public:
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
             return false;
 
-        Header r; deserialize(r, rbuf);
+        Header r;
+        deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (REVIVE)");
 
         // validação do bit A/R
