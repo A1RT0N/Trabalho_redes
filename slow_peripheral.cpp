@@ -224,6 +224,7 @@ public:
         hasPrev        = true;
         active         = true;
         lastCentralSeq = r.seq;
+        nextSeq        = r.seq + 1;
         window_size    = r.wnd;
 
         return true;
@@ -271,20 +272,20 @@ public:
     bool sendData(const string& msg) {
         if (!active) return false;
 
-        // Fragmentado
+        /* ---------- RAMO: fragmentado ---------- */
         if (msg.size() > DATA_MAX) {
             uint8_t fragment_id = nextSeq & 0xFF;
-            size_t offset = 0;
-            uint8_t fo = 0;
+            size_t  offset      = 0;
+            uint8_t fo          = 0;
 
             while (offset < msg.size()) {
                 size_t chunk = min(msg.size() - offset, (size_t)DATA_MAX);
 
                 if (bytesInFlight + chunk > window_size) {
                     cerr << "[ERRO] Janela cheia ("
-                         << bytesInFlight << "+" << chunk
-                         << " > " << window_size
-                         << "), aguarde ACK.\n";
+                        << bytesInFlight << "+" << chunk
+                        << " > " << window_size
+                        << "), aguarde ACK.\n";
                     return false;
                 }
 
@@ -303,15 +304,18 @@ public:
                 serialize(h, buf);
                 memcpy(buf + HDR_SIZE, msg.data() + offset, chunk);
                 printHeader(h, "Pacote Enviado (DATA fragmentado)");
+                cout << "PAYLOAD (" << chunk << " bytes): \""               // [PRINT] mostra o fragmento enviado
+                    << msg.substr(offset, chunk) << "\"\n\n";              // [PRINT]
 
                 bytesInFlight += chunk;
-                if (sendto(fd, buf, HDR_SIZE + chunk, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+                if (sendto(fd, buf, HDR_SIZE + chunk, 0,
+                        (sockaddr*)&srv, sizeof(srv)) < 0)
                     return false;
 
                 offset += chunk;
             }
-            
-            // Espera ACK final
+
+            /* espera ACK final */
             uint8_t rbuf[HDR_SIZE];
             sockaddr_in sa; socklen_t sl = sizeof(sa);
             if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
@@ -325,17 +329,18 @@ public:
             window_size     = r.wnd;
             lastCentralSeq  = r.seq;
             prevHdr         = r;
+            nextSeq         = lastCentralSeq + 1;
             return true;
         }
 
-        // sem fragmento
+        /* ---------- RAMO: sem fragmento ---------- */
         size_t payloadSize = msg.size();
 
         if (bytesInFlight + payloadSize > window_size) {
             cerr << "[ERRO] Janela cheia ("
-                 << bytesInFlight << "+" << payloadSize
-                 << " > " << window_size
-                 << "), aguarde ACK.\n";
+                << bytesInFlight << "+" << payloadSize
+                << " > " << window_size
+                << "), aguarde ACK.\n";
             return false;
         }
 
@@ -349,9 +354,12 @@ public:
         serialize(h, buf);
         memcpy(buf + HDR_SIZE, msg.data(), payloadSize);
         printHeader(h, "Pacote Enviado (DATA)");
+        cout << "PAYLOAD (" << payloadSize << " bytes): \""                // [PRINT] mostra a msg completa enviada
+            << msg << "\"\n\n";                                           // [PRINT]
 
         bytesInFlight += payloadSize;
-        if (sendto(fd, buf, HDR_SIZE + payloadSize, 0, (sockaddr*)&srv, sizeof(srv)) < 0)
+        if (sendto(fd, buf, HDR_SIZE + payloadSize, 0,
+                (sockaddr*)&srv, sizeof(srv)) < 0)
             return false;
 
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
@@ -363,13 +371,17 @@ public:
         printHeader(r, "Pacote Recebido (DATA)");
         if (!(r.sf & FLAG_ACK)) return false;
 
-        // libera janela e atualiza estado
+        /* atualiza estado */
         bytesInFlight   = 0;
         window_size     = r.wnd;
         lastCentralSeq  = r.seq;
         prevHdr         = r;
+        nextSeq         = lastCentralSeq + 1;
+
         return true;
     }
+
+
 
     /**
      * @brief Armazena sessão atual para revive futuro.
@@ -424,6 +436,8 @@ public:
         prevHdr        = r;
         active         = true;
         lastCentralSeq = r.seq;
+        nextSeq        = lastCentralSeq + 1;
+
         return true;
     }
 };
