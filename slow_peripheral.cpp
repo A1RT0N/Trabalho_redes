@@ -16,6 +16,7 @@ Cauê Paiva Lira - 14675416
 #include <errno.h>
 #include <cctype>
 #include <algorithm>
+#include <cstdint> 
 
 using namespace std;
 
@@ -101,6 +102,8 @@ uint16_t unpack16(const uint8_t* p) {
     return v;
 }
 
+
+
 /**
  * @brief Serializa um Header em buffer de bytes.
  */
@@ -166,6 +169,13 @@ private:
     uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
     uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
 
+    uint16_t advertisedWindow() const {
+        uint32_t livre = (window_size > bytesInFlight)
+                        ? (window_size - bytesInFlight)
+                        : 0;
+        return static_cast<uint16_t>(std::min<uint32_t>(livre, UINT16_MAX));
+    }
+
 public:
     UDPPeripheral(): fd(-1) {}
     ~UDPPeripheral() { if (fd >= 0) close(fd); }
@@ -193,40 +203,35 @@ public:
      * @brief Realiza handshake CONNECT→SETUP→ACK.
      */
     bool connect() {
-        // 1) Envia CONNECT
+        // 1) CONNECT
         Header h;
         h.seq = nextSeq++;
-        h.wnd = window_size;
+        h.wnd = advertisedWindow();   // <-- usa buffer local
         h.sf |= FLAG_C;
 
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
         printHeader(h, "Pacote Enviado (CONNECT)");
-
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
-        // 2) Recebe SETUP
+        // 2) SETUP
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
             return false;
 
-        Header r;
-        deserialize(r, rbuf);
+        Header r; deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (SETUP)");
-
         if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
-        // 3) Atualiza estado
+        // 3) Estado interno (NÃO copiar r.wnd)
         prevHdr        = r;
         hasPrev        = true;
         active         = true;
         lastCentralSeq = r.seq;
         nextSeq        = r.seq + 1;
-        window_size    = r.wnd;
-
         return true;
     }
 
@@ -272,115 +277,70 @@ public:
     bool sendData(const string& msg) {
         if (!active) return false;
 
-        /* ---------- RAMO: fragmentado ---------- */
-        if (msg.size() > DATA_MAX) {
-            uint8_t fragment_id = nextSeq & 0xFF;
-            size_t  offset      = 0;
-            uint8_t fo          = 0;
-
-            while (offset < msg.size()) {
-                size_t chunk = min(msg.size() - offset, (size_t)DATA_MAX);
-
-                if (bytesInFlight + chunk > window_size) {
-                    cerr << "[ERRO] Janela cheia ("
-                        << bytesInFlight << "+" << chunk
-                        << " > " << window_size
-                        << "), aguarde ACK.\n";
-                    return false;
-                }
-
-                Header h = prevHdr;
-                h.seq = nextSeq++;
-                h.ack = lastCentralSeq;
-                h.wnd = window_size;
-
-                uint32_t f = FLAG_ACK;
-                if (offset + chunk < msg.size()) f |= FLAG_MB;
-                h.sf  = (h.sf & ~0x1F) | f;
-                h.fid = fragment_id;
-                h.fo  = fo++;
-
-                uint8_t buf[HDR_SIZE + DATA_MAX];
-                serialize(h, buf);
-                memcpy(buf + HDR_SIZE, msg.data() + offset, chunk);
-                printHeader(h, "Pacote Enviado (DATA fragmentado)");
-                cout << "PAYLOAD (" << chunk << " bytes): \""               // [PRINT] mostra o fragmento enviado
-                    << msg.substr(offset, chunk) << "\"\n\n";              // [PRINT]
-
-                bytesInFlight += chunk;
-                if (sendto(fd, buf, HDR_SIZE + chunk, 0,
-                        (sockaddr*)&srv, sizeof(srv)) < 0)
-                    return false;
-
-                offset += chunk;
+        auto enviaFragmento = [&](const char* data, size_t len,
+                                uint8_t fid, uint8_t fo, bool more) -> bool {
+            if (bytesInFlight + len > window_size) {
+                cerr << "[ERRO] Janela cheia (" << bytesInFlight
+                    << "+" << len << " > " << window_size << "), aguarde ACK.\n";
+                return false;
             }
 
-            /* espera ACK final */
-            uint8_t rbuf[HDR_SIZE];
-            sockaddr_in sa; socklen_t sl = sizeof(sa);
-            if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+            Header h = prevHdr;
+            h.seq = nextSeq++;
+            h.ack = lastCentralSeq;
+            h.wnd = advertisedWindow();
+            h.sf  = (h.sf & ~0x1F) | FLAG_ACK | (more ? FLAG_MB : 0);
+            h.fid = fid;
+            h.fo  = fo;
+
+            uint8_t buf[HDR_SIZE + DATA_MAX];
+            serialize(h, buf);
+            memcpy(buf + HDR_SIZE, data, len);
+            printHeader(h, "Pacote Enviado (DATA)");
+            cout << "PAYLOAD (" << len << " bytes): \""
+                << string(data, len) << "\"\n\n";
+
+            bytesInFlight += len;
+            return sendto(fd, buf, HDR_SIZE + len, 0,
+                        (sockaddr*)&srv, sizeof(srv)) >= 0;
+        };
+
+        /* --------- FRAGMENTADO --------- */
+        if (msg.size() > DATA_MAX) {
+            uint8_t fid = nextSeq & 0xFF;
+            uint8_t fo  = 0;
+            size_t  off = 0;
+            while (off < msg.size()) {
+                size_t chunk = std::min(msg.size() - off, (size_t)DATA_MAX);
+                bool   more  = (off + chunk < msg.size());
+                if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more))
+                    return false;
+                off += chunk;
+            }
+        }
+        /* --------- NÃO FRAGMENTADO --------- */
+        else {
+            if (!enviaFragmento(msg.data(), msg.size(), 0, 0, false))
                 return false;
-
-            Header r; deserialize(r, rbuf);
-            printHeader(r, "Pacote Recebido (DATA final)");
-            if (!(r.sf & FLAG_ACK)) return false;
-
-            bytesInFlight   = 0;
-            window_size     = r.wnd;
-            lastCentralSeq  = r.seq;
-            prevHdr         = r;
-            nextSeq         = lastCentralSeq + 1;
-            return true;
         }
 
-        /* ---------- RAMO: sem fragmento ---------- */
-        size_t payloadSize = msg.size();
-
-        if (bytesInFlight + payloadSize > window_size) {
-            cerr << "[ERRO] Janela cheia ("
-                << bytesInFlight << "+" << payloadSize
-                << " > " << window_size
-                << "), aguarde ACK.\n";
-            return false;
-        }
-
-        Header h = prevHdr;
-        h.seq = nextSeq++;
-        h.ack = lastCentralSeq;
-        h.wnd = window_size;
-        h.sf  = (h.sf & ~0x1F) | FLAG_ACK;
-
-        uint8_t buf[HDR_SIZE + DATA_MAX];
-        serialize(h, buf);
-        memcpy(buf + HDR_SIZE, msg.data(), payloadSize);
-        printHeader(h, "Pacote Enviado (DATA)");
-        cout << "PAYLOAD (" << payloadSize << " bytes): \""                // [PRINT] mostra a msg completa enviada
-            << msg << "\"\n\n";                                           // [PRINT]
-
-        bytesInFlight += payloadSize;
-        if (sendto(fd, buf, HDR_SIZE + payloadSize, 0,
-                (sockaddr*)&srv, sizeof(srv)) < 0)
-            return false;
-
-        uint8_t rbuf[HDR_SIZE + DATA_MAX];
+        /* --- Espera ACK final --- */
+        uint8_t rbuf[HDR_SIZE];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
-        if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+        if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
             return false;
 
         Header r; deserialize(r, rbuf);
-        printHeader(r, "Pacote Recebido (DATA)");
+        printHeader(r, "Pacote Recebido (ACK DATA)");
         if (!(r.sf & FLAG_ACK)) return false;
 
-        /* atualiza estado */
+        /* Atualiza controle de fluxo (sem tocar em window_size) */
         bytesInFlight   = 0;
-        window_size     = r.wnd;
         lastCentralSeq  = r.seq;
         prevHdr         = r;
         nextSeq         = lastCentralSeq + 1;
-
         return true;
     }
-
 
 
     /**
