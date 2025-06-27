@@ -31,6 +31,8 @@ static const uint32_t FLAG_ACK = 1 << 2;   ///< Reconhecimento (Ack)
 static const uint32_t FLAG_AR  = 1 << 1;   ///< Aceitar/Pronto
 static const uint32_t FLAG_MB  = 1 << 0;   ///< Mais Bits (fragmentação)
 
+// A janela foi considerada como tamanho 7200
+
 /**
  * @struct SID
  * @brief Identificador de sessão (16 bytes).
