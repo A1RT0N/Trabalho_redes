@@ -1,85 +1,137 @@
-# Cliente UDPPeripheral (Protocolo SLOW)
+# Cliente **UDP Peripheral** – Protocolo **SLOW** (versão 2)
 
-**Autores**: Ayrton da Costa Ganem Filho (14560190), Luiz Felipe Diniz Costa (13782032), Cauê Paiva Lira (14675416)
+**Autores**
+Ayrton da Costa Ganem Filho (14560190) · Luiz Felipe Diniz Costa (13782032) · Cauê Paiva Lira (14675416)
 
-## Visão Geral
+---
 
-Este programa implementa o protocolo de transporte SLOW sobre UDP (inspirado no QUIC), atuando como *peripheral*. Ele oferece as seguintes funcionalidades:
+## Visão geral
 
-* **3-way connect**: handshake de conexão (CONNECT → SETUP → ACK)
-* **Transferência de dados**: fragmentação de mensagens longas, controle de fluxo por janela deslizante e confirmação (ACK)
-* **Disconnect**: encerramento formal da sessão (CONNECT+REVOKE+ACK)
-* **0-way revive**: retomada de sessão inativa sem novo handshake completo
+Esta nova versão do *peripheral* SLOW expande a implementação original com:
+
+| Recurso                                | O que mudou?                                                                                                                                                                      |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Controle de fluxo preciso**          | A janela anunciada ao servidor agora reflete o *buffer* local disponível em tempo real (`advertisedWindow()`), evitando *overrun*.                                                |
+| **Gerenciamento de bytes em trânsito** | `bytesInFlight` rastreia dados não-confirmados, bloqueando novos envios quando ultrapassariam a janela remota.                                                                    |
+| **Fragmentação inteligente**           | Mensagens maiores que `DATA_MAX` (1 440 bytes) são quebradas em blocos respeitando tanto `DATA_MAX` quanto o espaço restante da janela do servidor (`remoteWnd - bytesInFlight`). |
+| **ACK automático**                     | Toda troca DATA↔ACK é tratada por `esperaAck()`, que atualiza `lastCentralSeq`, renova a janela e zera `bytesInFlight`.                                                           |
+| **REVIVE zero-way robusto**            | Valida o bit **A/R** de aceitação; se rejeitado, informa o motivo.                                                                                                                |
+| **Logs detalhados**                    | Função `printHeader()` exibe cada campo do cabeçalho; mensagens **DEBUG** mostram a “janela efetiva” antes de cada envio.                                                         |
+| **Menu interativo revisado**           | Mesmo conjunto de comandos, mas com avisos/erros mais claros e mensagens de ajuda formatadas em box-drawing.                                                                      |
+
+---
 
 ## Pré-requisitos
 
-* Compilador C++17 (por exemplo, `g++`)
-* Sistema POSIX (Linux, macOS)
-* Make
+* Compilador **C++17**
+  Recomendado: `g++` ≥ 9.0
+* Sistema **POSIX** (Linux/macOS). Testado em Ubuntu 22.04
+* **Make** (GNU Make)
+* Permissão para criar sockets UDP na porta de origem aleatória
+
+---
 
 ## Compilação
 
-No diretório do projeto, execute:
+No diretório do projeto:
 
 ```bash
 make
 ```
 
-Isso irá gerar o executável `slow_peripheral`.
+Gera o binário `slow_peripheral`.
 
-## Uso
+---
+
+## Execução rápida
+
 
 ```bash
-make run
+make run           
 ```
 
-Após conectar, um menu interativo é exibido com as opções abaixo.
+---
 
-## Comandos Interativos
+## Menu de comandos
 
-* `data` ou `1`      : enviar mensagem de texto para o servidor
-* `disconnect` ou `2`: desconectar do servidor e armazenar sessão
-* `revive` ou `3`    : reviver a sessão anteriormente armazenada
-* `status` ou `4`    : exibir status da conexão e disponibilidade de *revive*
-* `help` ou `5`      : mostrar este guia de comandos
-* `exit` ou `6`      : desconectar (se conectado) e encerrar o programa
+| Comando        | Alias            | Função                                                                        |
+| -------------- | ---------------- | ----------------------------------------------------------------------------- |
+| **data**       | `1`              | Envia texto ao servidor (fragmenta se necessário)                             |
+| **disconnect** | `2`              | Termina a sessão via “CONNECT + REVIVE + ACK” e salva estado                  |
+| **revive**     | `3`              | Restaura sessão salva (**zero-way handshake**) enviando uma mensagem opcional |
+| **status**     | `4`              | Exibe host, estado da conexão e disponibilidade de *revive*                   |
+| **help**       | `5`              | Mostra explicação dos comandos                                                |
+| **exit**       | `6` `quit` `end` | Desconecta (se necessário) e finaliza o cliente                               |
 
-## Exemplos de Uso
+---
 
-```bash
-$ ./slow_peripheral slow.gmelodie.com 7033
+## Exemplo de sessão
+
+```text
+=================================================
+         UDP Peripheral Client v1.0
+=================================================
 Conectando ao servidor slow.gmelodie.com:7033...
 [OK] Conectado com sucesso!
 
+┌─────────────────────────────────────────────┐
+│                  MENU                       │
+│ 1. data       - Enviar dados                │
+│ 2. disconnect - Desconectar do servidor     │
+│ 3. revive     - Reviver sessão anterior     │
+│ 4. status     - Ver status da conexão       │
+│ 5. help       - Mostrar ajuda               │
+│ 6. exit       - Sair do programa            │
+└─────────────────────────────────────────────┘
+
 > data
-Digite sua mensagem: Olá, SLOW!
+Digite sua mensagem: Mensagem gigante que será fragmentada...
+[DEBUG] Janela efetiva do central: 1024 (reportada: 1024, bytes em trânsito: 0)
+---- Pacote Enviado (DATA) ----
+(... cabeçalho + payload ...)
+---- Pacote Recebido (ACK DATA) ----
+[DEBUG] Janela atualizada: 1024
 [OK] Mensagem enviada com sucesso!
 
 > disconnect
 Desconectando do servidor...
+---- Pacote Enviado (DISCONNECT) ----
+---- Pacote Recebido (DISCONNECT) ----
 [OK] Desconectado com sucesso!
 
 > revive
-Digite uma mensagem para revive: Reativando sessão
+Tentando reviver sessão...
+Digite uma mensagem para enviar com o revive: Olá de novo!
+---- Pacote Enviado (REVIVE) ----
+---- Pacote Recebido (REVIVE) ----
 [OK] Sessão revivida com sucesso!
-
-> status
-┌─────────────────────────────────────────────┐
-│                  STATUS                    │
-├─────────────────────────────────────────────┤
-│ Servidor: slow.gmelodie.com:7033           │
-│ Conexão:  [CONECTADO]                      │
-│ Sessão:   [DISPONÍVEL]                     │
-└─────────────────────────────────────────────┘
 
 > exit
 Até logo!
 ```
 
-## Documentação do Código
+---
 
-Principais componentes:
+## Estrutura do código-fonte
 
-* **Header**: estrutura que representa o cabeçalho SLOW, com métodos de (de)serialização *little-endian*.
-* **UDPPeripheral**: classe responsável por gerenciar o socket UDP, implementar o handshake, fragmentação de dados, controle de fluxo e lógica de *revive* e *disconnect*.
-* **Funções utilitárias**: para converter valores (`pack16`, `unpack32`, etc.) e imprimir o estado do cabeçalho.
+* **`SID`**
+  *16 bytes* que identificam a sessão. Métodos utilitários `nil()` e `isEqual()`.
+
+* **`Header`**
+  Representa o cabeçalho SLOW (32 bytes). Construtor zera campos; macros `FLAG_*` definem bits de controle.
+
+* **Funções de serialização** (`pack16/32`, `unpack16/32`, `serialize`, `deserialize`)
+  Lidam com *little-endian* sem depender de `htonl/ntohl`.
+
+* **`UDPPeripheral`**
+
+  * `init()` – cria socket e resolve DNS
+  * `connect()` – 3-way handshake (CONNECT → SETUP → ACK)
+  * `sendData()` – fragmenta, envia e espera ACKs, respeitando `remoteWnd`
+  * `disconnect()` – encerramento formal com confirmação
+  * `zeroWay()` – revive sem handshake
+  * Variáveis internas monitoram janela local, remota e bytes “em voo”
+
+* **Interface CLI** (`main`)
+  Menus ASCII, leitura segura de comandos, mensagens de erro/aviso padronizadas.
+
