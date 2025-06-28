@@ -31,8 +31,6 @@ static const uint32_t FLAG_ACK = 1 << 2;   ///< Reconhecimento (Ack)
 static const uint32_t FLAG_AR  = 1 << 1;   ///< Aceitar/Pronto
 static const uint32_t FLAG_MB  = 1 << 0;   ///< Mais Bits (fragmentação)
 
-// A janela foi considerada como tamanho 7200
-
 // Observação: o data implementado já envia o ACK
 
 /**
@@ -172,37 +170,12 @@ private:
     uint32_t   lastCentralSeq = 0;///< Último seq do servidor
     uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
     uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
-    uint32_t   centralWindow  = 0; ///< Tamanho da janela do central (último reportado)
 
     uint16_t advertisedWindow() const {
         uint32_t livre = (window_size > bytesInFlight)
                         ? (window_size - bytesInFlight)
                         : 0;
         return static_cast<uint16_t>(std::min<uint32_t>(livre, UINT16_MAX));
-    }
-    
-    /**
-     * @brief Verifica se há espaço suficiente na janela do central
-     * @param size Tamanho dos dados a serem enviados
-     * @return true se houver espaço suficiente, false caso contrário
-     */
-    bool hasWindowSpace(size_t size) const {
-        // Se centralWindow for 0, não sabemos o tamanho ainda (primeiro envio)
-        if (centralWindow == 0) return true;
-        
-        // Calculamos a janela efetiva considerando os bytes em trânsito
-        uint32_t efetiva = (bytesInFlight < centralWindow) ? 
-                           (centralWindow - bytesInFlight) : 0;
-                           
-        // Verificamos se há espaço suficiente na janela efetiva
-        if (size > efetiva) {
-            cerr << "[DEBUG] Janela efetiva do central: " << efetiva 
-                 << " (reportada: " << centralWindow 
-                 << ", bytes em trânsito: " << bytesInFlight << ")\n";
-            return false;
-        }
-        
-        return true;
     }
 
 public:
@@ -255,13 +228,15 @@ public:
         if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
-        // 3) Estado interno (Agora copia r.wnd para centralWindow)
+        // 3) Estado interno - Atualiza o window_size com base na janela do servidor
         prevHdr        = r;
         hasPrev        = true;
         active         = true;
         lastCentralSeq = r.seq;
         nextSeq        = r.seq + 1;
-        centralWindow  = r.wnd;
+        window_size    = r.wnd;  // Usa o tamanho da janela informado pelo servidor
+        cout << "[DEBUG] Janela efetiva do central: " << window_size << " (reportada: " << r.wnd << ", bytes em trânsito: " << bytesInFlight << ")\n";
+        
         return true;
     }
 
@@ -294,8 +269,6 @@ public:
                 printHeader(rr, "Pacote Recebido (DISCONNECT)");
                 if (rr.sf & FLAG_ACK) {
                     active = false;
-                    bytesInFlight = 0;  // Reset bytes in flight
-                    centralWindow = 0;  // Reset central window
                     return true;
                 }
             }
@@ -311,16 +284,12 @@ public:
 
         auto enviaFragmento = [&](const char* data, size_t len,
                                 uint8_t fid, uint8_t fo, bool more) -> bool {
+            // Verifica se há espaço disponível na janela
             if (bytesInFlight + len > window_size) {
-                cerr << "[ERRO] Janela local cheia (" << bytesInFlight
-                    << "+" << len << " > " << window_size << "), aguarde ACK.\n";
-                return false;
-            }
-            
-            if (!hasWindowSpace(len)) {
-                cerr << "[ERRO] Janela do central insuficiente (" 
-                    << centralWindow << " bytes livres, tentando enviar " 
-                    << len << " bytes). Aguarde ACK.\n";
+                cout << "[DEBUG] Janela efetiva do central: " << window_size 
+                     << " (reportada: " << window_size << ", bytes em trânsito: " << bytesInFlight << ")\n";
+                cerr << "[ERRO] Janela do central insuficiente (" << (window_size - bytesInFlight) 
+                     << " bytes livres, tentando enviar " << len << " bytes). Aguarde ACK.\n";
                 return false;
             }
 
@@ -337,20 +306,34 @@ public:
             memcpy(buf + HDR_SIZE, data, len);
             printHeader(h, "Pacote Enviado (DATA)");
             cout << "PAYLOAD (" << len << " bytes): \""
-                << string(data, len) << "\"\n\n";
+                << string(data, len < 50 ? len : 50) << (len > 50 ? "..." : "") << "\"\n\n";
 
             bytesInFlight += len;
-            
-            // Verifica se a janela está ficando pequena após envio
-            uint32_t efetiva = (bytesInFlight < centralWindow) ? 
-                              (centralWindow - bytesInFlight) : 0;
-            if (efetiva < DATA_MAX / 2 && centralWindow > 0) {
-                cout << "[AVISO] Janela efetiva do central está pequena: " 
-                     << efetiva << " bytes livres.\n";
-            }
-            
             return sendto(fd, buf, HDR_SIZE + len, 0,
                         (sockaddr*)&srv, sizeof(srv)) >= 0;
+        };
+
+        // Função para esperar o ACK e atualizar os dados de controle
+        auto esperaAck = [&]() -> bool {
+            uint8_t rbuf[HDR_SIZE];
+            sockaddr_in sa; socklen_t sl = sizeof(sa);
+            if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
+                return false;
+
+            Header r; deserialize(r, rbuf);
+            printHeader(r, "Pacote Recebido (ACK DATA)");
+            
+            if (!(r.sf & FLAG_ACK)) return false;
+
+            // Atualiza controle de fluxo e janela
+            bytesInFlight   = 0;
+            lastCentralSeq  = r.seq;
+            prevHdr         = r;
+            nextSeq         = lastCentralSeq + 1;
+            window_size     = r.wnd; // Atualiza a janela com o valor mais recente do servidor
+            
+            cout << "[DEBUG] Janela atualizada: " << window_size << "\n";
+            return true;
         };
 
         /* --------- FRAGMENTADO --------- */
@@ -358,40 +341,50 @@ public:
             uint8_t fid = nextSeq & 0xFF;
             uint8_t fo  = 0;
             size_t  off = 0;
+            
             while (off < msg.size()) {
-                size_t chunk = std::min(msg.size() - off, (size_t)DATA_MAX);
-                bool   more  = (off + chunk < msg.size());
+                // Determina o tamanho máximo que pode ser enviado nesta iteração
+                size_t chunkMax = std::min(msg.size() - off, (size_t)DATA_MAX);
+                // Limita também ao espaço disponível na janela
+                size_t chunk = std::min(chunkMax, (size_t)(window_size - bytesInFlight));
+                
+                if (chunk == 0) {
+                    // Se não há espaço na janela, espera um ACK e tenta novamente
+                    if (!esperaAck()) return false;
+                    continue; // Tenta enviar novamente após receber o ACK
+                }
+                
+                bool more = (off + chunk < msg.size());
+                
                 if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more))
                     return false;
+                    
                 off += chunk;
+                
+                // Se ainda há dados para enviar e a janela está cheia, espera ACK
+                if (more && (bytesInFlight + std::min((size_t)DATA_MAX, (size_t)(msg.size() - off)) > window_size)) {
+                    if (!esperaAck()) return false;
+                }
             }
+            
+            // Garantir que tenhamos o ACK final
+            return esperaAck();
         }
         /* --------- NÃO FRAGMENTADO --------- */
         else {
-            if (!enviaFragmento(msg.data(), msg.size(), 0, 0, false))
+            // Para mensagens que cabem em um único pacote
+            if (msg.size() <= window_size) {
+                if (!enviaFragmento(msg.data(), msg.size(), 0, 0, false))
+                    return false;
+                    
+                return esperaAck();
+            } else {
+                // Mensagem maior que a janela, mas menor que DATA_MAX (caso raro)
+                cerr << "[ERRO] Mensagem não fragmentada excede a janela (" 
+                     << msg.size() << " > " << window_size << ")\n";
                 return false;
+            }
         }
-
-        /* --- Espera ACK final --- */
-        uint8_t rbuf[HDR_SIZE];
-        sockaddr_in sa; socklen_t sl = sizeof(sa);
-        if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
-            return false;
-
-        Header r; deserialize(r, rbuf);
-        printHeader(r, "Pacote Recebido (ACK DATA)");
-        
-        if (!(r.sf & FLAG_ACK)) return false;
-
-        /* Atualiza controle de fluxo (agora atualizando centralWindow) */
-        bytesInFlight   = 0;
-        lastCentralSeq  = r.seq;
-        prevHdr         = r;
-        centralWindow   = r.wnd;  // Atualiza o tamanho da janela do central
-        nextSeq         = lastCentralSeq + 1;
-        
-        cout << "[INFO] Janela do central atualizada: " << centralWindow << " bytes livres.\n";
-        return true;
     }
 
 
@@ -409,19 +402,6 @@ public:
      * @brief Indica se há sessão para revive.
      */
     bool canRevive() const { return hasPrev; }
-    
-    /**
-     * @brief Imprime informações sobre as janelas e bytes em trânsito
-     */
-    void printWindowStatus() const {
-        uint32_t efetiva = (bytesInFlight < centralWindow) ? 
-                           (centralWindow - bytesInFlight) : 0;
-                           
-        cout << "│ Janela local:       " << window_size << " bytes       │\n";
-        cout << "│ Bytes em trânsito:  " << bytesInFlight << " bytes       │\n";
-        cout << "│ Janela do central:  " << centralWindow << " bytes       │\n";
-        cout << "│ Janela efetiva:     " << efetiva << " bytes       │\n";
-    }
 
     /**
      * @brief Retoma sessão sem handshake completo (zero-way).
@@ -461,10 +441,8 @@ public:
         prevHdr        = r;
         active         = true;
         lastCentralSeq = r.seq;
-        centralWindow  = r.wnd;  // Atualiza o tamanho da janela do central
         nextSeq        = lastCentralSeq + 1;
 
-        cout << "[INFO] Janela do central atualizada: " << centralWindow << " bytes livres.\n";
         return true;
     }
 };
@@ -519,11 +497,6 @@ void printStatus(const UDPPeripheral& p, bool connected) {
     cout << "│ Servidor: slow.gmelodie.com:7033            │\n";
     cout << "│ Conexão:  " << (connected ? "[CONECTADO]   " : "[DESCONECTADO]") << "            │\n";
     cout << "│ Sessão:   " << (p.canRevive() ? "[DISPONÍVEL]  " : "[INDISPONÍVEL]") << "            │\n";
-    
-    if (connected) {
-        p.printWindowStatus();
-    }
-    
     cout << "└─────────────────────────────────────────────┘\n";
 }
 
