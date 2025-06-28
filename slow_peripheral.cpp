@@ -33,6 +33,8 @@ static const uint32_t FLAG_MB  = 1 << 0;   ///< Mais Bits (fragmentação)
 
 // A janela foi considerada como tamanho 7200
 
+// Observação: o data implementado já envia o ACK
+
 /**
  * @struct SID
  * @brief Identificador de sessão (16 bytes).
@@ -170,12 +172,37 @@ private:
     uint32_t   lastCentralSeq = 0;///< Último seq do servidor
     uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
     uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
+    uint32_t   centralWindow  = 0; ///< Tamanho da janela do central (último reportado)
 
     uint16_t advertisedWindow() const {
         uint32_t livre = (window_size > bytesInFlight)
                         ? (window_size - bytesInFlight)
                         : 0;
         return static_cast<uint16_t>(std::min<uint32_t>(livre, UINT16_MAX));
+    }
+    
+    /**
+     * @brief Verifica se há espaço suficiente na janela do central
+     * @param size Tamanho dos dados a serem enviados
+     * @return true se houver espaço suficiente, false caso contrário
+     */
+    bool hasWindowSpace(size_t size) const {
+        // Se centralWindow for 0, não sabemos o tamanho ainda (primeiro envio)
+        if (centralWindow == 0) return true;
+        
+        // Calculamos a janela efetiva considerando os bytes em trânsito
+        uint32_t efetiva = (bytesInFlight < centralWindow) ? 
+                           (centralWindow - bytesInFlight) : 0;
+                           
+        // Verificamos se há espaço suficiente na janela efetiva
+        if (size > efetiva) {
+            cerr << "[DEBUG] Janela efetiva do central: " << efetiva 
+                 << " (reportada: " << centralWindow 
+                 << ", bytes em trânsito: " << bytesInFlight << ")\n";
+            return false;
+        }
+        
+        return true;
     }
 
 public:
@@ -228,12 +255,13 @@ public:
         if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
-        // 3) Estado interno (NÃO copiar r.wnd)
+        // 3) Estado interno (Agora copia r.wnd para centralWindow)
         prevHdr        = r;
         hasPrev        = true;
         active         = true;
         lastCentralSeq = r.seq;
         nextSeq        = r.seq + 1;
+        centralWindow  = r.wnd;
         return true;
     }
 
@@ -266,6 +294,8 @@ public:
                 printHeader(rr, "Pacote Recebido (DISCONNECT)");
                 if (rr.sf & FLAG_ACK) {
                     active = false;
+                    bytesInFlight = 0;  // Reset bytes in flight
+                    centralWindow = 0;  // Reset central window
                     return true;
                 }
             }
@@ -282,8 +312,15 @@ public:
         auto enviaFragmento = [&](const char* data, size_t len,
                                 uint8_t fid, uint8_t fo, bool more) -> bool {
             if (bytesInFlight + len > window_size) {
-                cerr << "[ERRO] Janela cheia (" << bytesInFlight
+                cerr << "[ERRO] Janela local cheia (" << bytesInFlight
                     << "+" << len << " > " << window_size << "), aguarde ACK.\n";
+                return false;
+            }
+            
+            if (!hasWindowSpace(len)) {
+                cerr << "[ERRO] Janela do central insuficiente (" 
+                    << centralWindow << " bytes livres, tentando enviar " 
+                    << len << " bytes). Aguarde ACK.\n";
                 return false;
             }
 
@@ -303,6 +340,15 @@ public:
                 << string(data, len) << "\"\n\n";
 
             bytesInFlight += len;
+            
+            // Verifica se a janela está ficando pequena após envio
+            uint32_t efetiva = (bytesInFlight < centralWindow) ? 
+                              (centralWindow - bytesInFlight) : 0;
+            if (efetiva < DATA_MAX / 2 && centralWindow > 0) {
+                cout << "[AVISO] Janela efetiva do central está pequena: " 
+                     << efetiva << " bytes livres.\n";
+            }
+            
             return sendto(fd, buf, HDR_SIZE + len, 0,
                         (sockaddr*)&srv, sizeof(srv)) >= 0;
         };
@@ -334,13 +380,17 @@ public:
 
         Header r; deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (ACK DATA)");
+        
         if (!(r.sf & FLAG_ACK)) return false;
 
-        /* Atualiza controle de fluxo (sem tocar em window_size) */
+        /* Atualiza controle de fluxo (agora atualizando centralWindow) */
         bytesInFlight   = 0;
         lastCentralSeq  = r.seq;
         prevHdr         = r;
+        centralWindow   = r.wnd;  // Atualiza o tamanho da janela do central
         nextSeq         = lastCentralSeq + 1;
+        
+        cout << "[INFO] Janela do central atualizada: " << centralWindow << " bytes livres.\n";
         return true;
     }
 
@@ -359,6 +409,19 @@ public:
      * @brief Indica se há sessão para revive.
      */
     bool canRevive() const { return hasPrev; }
+    
+    /**
+     * @brief Imprime informações sobre as janelas e bytes em trânsito
+     */
+    void printWindowStatus() const {
+        uint32_t efetiva = (bytesInFlight < centralWindow) ? 
+                           (centralWindow - bytesInFlight) : 0;
+                           
+        cout << "│ Janela local:       " << window_size << " bytes       │\n";
+        cout << "│ Bytes em trânsito:  " << bytesInFlight << " bytes       │\n";
+        cout << "│ Janela do central:  " << centralWindow << " bytes       │\n";
+        cout << "│ Janela efetiva:     " << efetiva << " bytes       │\n";
+    }
 
     /**
      * @brief Retoma sessão sem handshake completo (zero-way).
@@ -398,8 +461,10 @@ public:
         prevHdr        = r;
         active         = true;
         lastCentralSeq = r.seq;
+        centralWindow  = r.wnd;  // Atualiza o tamanho da janela do central
         nextSeq        = lastCentralSeq + 1;
 
+        cout << "[INFO] Janela do central atualizada: " << centralWindow << " bytes livres.\n";
         return true;
     }
 };
@@ -454,6 +519,11 @@ void printStatus(const UDPPeripheral& p, bool connected) {
     cout << "│ Servidor: slow.gmelodie.com:7033            │\n";
     cout << "│ Conexão:  " << (connected ? "[CONECTADO]   " : "[DESCONECTADO]") << "            │\n";
     cout << "│ Sessão:   " << (p.canRevive() ? "[DISPONÍVEL]  " : "[INDISPONÍVEL]") << "            │\n";
+    
+    if (connected) {
+        p.printWindowStatus();
+    }
+    
     cout << "└─────────────────────────────────────────────┘\n";
 }
 
