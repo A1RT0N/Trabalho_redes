@@ -221,42 +221,30 @@ private:
      * @return true se ACK recebido, false em caso de erro
      */
     bool sendWithRetry(const uint8_t* buf, size_t len, uint32_t seq, size_t dataSize) {
-        // Adiciona à fila de pacotes pendentes
         pendingQueue.emplace_back(buf, len, seq, dataSize);
         bytesInFlight += dataSize;
 
         for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
-            cout << "[DEBUG] Tentativa " << attempt << "/" << MAX_RETRIES 
-                 << " para seq=" << seq << "\n";
-
-            // Verifica se ainda cabe na janela atual antes de enviar
             if (bytesInFlight > window_size) {
-                cout << "[DEBUG] Pacote não cabe na janela atual (" 
-                     << bytesInFlight << " > " << window_size << "), aguardando espaço...\n";
-                // Remove da fila e espera por ACKs para liberar espaço
                 bytesInFlight -= dataSize;
                 pendingQueue.pop_back();
                 return false;
             }
 
-            // Envia o pacote
             if (sendto(fd, buf, len, 0, (sockaddr*)&srv, sizeof(srv)) < 0) {
-                cerr << "[ERRO] Falha no sendto para seq=" << seq << "\n";
                 continue;
             }
 
-            // Configura timeout para recepção
             fd_set readfds;
             struct timeval timeout;
             FD_ZERO(&readfds);
             FD_SET(fd, &readfds);
-            timeout.tv_sec = 2;  // 2 segundos de timeout
+            timeout.tv_sec = 2;
             timeout.tv_usec = 0;
 
             int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
             
             if (result > 0 && FD_ISSET(fd, &readfds)) {
-                // Dados disponíveis para leitura
                 uint8_t rbuf[HDR_SIZE];
                 sockaddr_in sa;
                 socklen_t sl = sizeof(sa);
@@ -268,28 +256,16 @@ private:
                     printHeader(r, "Pacote Recebido (ACK)");
                     
                     if (r.sf & FLAG_ACK) {
-                        // ACK válido recebido
                         removePendingPackets(r.ack);
                         lastCentralSeq = r.seq;
                         prevHdr = r;
                         window_size = r.wnd;
-                        
-                        cout << "[DEBUG] ACK recebido para acknum=" << r.ack 
-                             << ", janela atualizada: " << window_size << "\n";
                         return true;
-                    } else {
-                        cout << "[DEBUG] Pacote recebido não é ACK válido\n";
                     }
                 }
-            } else if (result == 0) {
-                cout << "[DEBUG] Timeout aguardando ACK para seq=" << seq << "\n";
-            } else {
-                cerr << "[ERRO] Erro no select: " << strerror(errno) << "\n";
             }
         }
 
-        // Todas as tentativas falharam, remove da fila
-        cout << "[ERRO] Máximo de tentativas excedido para seq=" << seq << "\n";
         bytesInFlight -= dataSize;
         pendingQueue.pop_back();
         return false;
@@ -322,10 +298,9 @@ public:
      * @brief Realiza handshake CONNECT→SETUP→ACK.
      */
     bool connect() {
-        // 1) CONNECT
         Header h;
         h.seq = nextSeq++;
-        h.wnd = advertisedWindow();   // <-- usa buffer local
+        h.wnd = advertisedWindow();
         h.sf |= FLAG_C;
 
         uint8_t buf[HDR_SIZE];
@@ -334,7 +309,6 @@ public:
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
-        // 2) SETUP
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
@@ -345,16 +319,14 @@ public:
         if (r.ack != 0 || !(r.sf & FLAG_AR))
             return false;
 
-        // 3) Estado interno - Atualiza o window_size com base na janela do servidor
         prevHdr        = r;
         hasPrev        = true;
         active         = true;
         lastCentralSeq = r.seq;
         nextSeq        = r.seq + 1;
-        window_size    = r.wnd;  // Usa o tamanho da janela informado pelo servidor
-        bytesInFlight  = 0;      // Zera bytes em trânsito
-        pendingQueue.clear();    // Limpa fila de pacotes pendentes
-        cout << "[DEBUG] Janela efetiva do central: " << window_size << " (reportada: " << r.wnd << ", bytes em trânsito: " << bytesInFlight << ")\n";
+        window_size    = r.wnd;
+        bytesInFlight  = 0;
+        pendingQueue.clear();
         
         return true;
     }
@@ -405,10 +377,7 @@ public:
 
         auto enviaFragmento = [&](const char* data, size_t len,
                                 uint8_t fid, uint8_t fo, bool more) -> bool {
-            // Verifica se há espaço disponível na janela
             if (bytesInFlight + len > window_size) {
-                cout << "[DEBUG] Janela insuficiente (" << (window_size - bytesInFlight) 
-                     << " bytes livres, tentando enviar " << len << " bytes)\n";
                 return false;
             }
 
@@ -427,7 +396,6 @@ public:
             cout << "PAYLOAD (" << len << " bytes): \""
                 << string(data, len < 50 ? len : 50) << (len > 50 ? "..." : "") << "\"\n\n";
 
-            // Usa o novo sistema de envio com retransmissão
             return sendWithRetry(buf, HDR_SIZE + len, h.seq, len);
         };
 
@@ -438,25 +406,17 @@ public:
             size_t  off = 0;
             
             while (off < msg.size()) {
-                // Determina o tamanho do fragmento
                 size_t chunk = std::min(msg.size() - off, (size_t)DATA_MAX);
                 
-                // Ajusta chunk para caber na janela disponível
                 size_t available_window = (window_size > bytesInFlight) ? (window_size - bytesInFlight) : 0;
                 if (chunk > available_window) {
                     if (available_window == 0) {
-                        // Não há espaço na janela, aguarda ACKs para liberar espaço
-                        cout << "[DEBUG] Aguardando espaço na janela (janela cheia: " 
-                             << bytesInFlight << "/" << window_size << ")...\n";
-                        
-                        // Se há pacotes pendentes, aguarda seus ACKs
                         if (!pendingQueue.empty()) {
-                            // Configura timeout para recepção
                             fd_set readfds;
                             struct timeval timeout;
                             FD_ZERO(&readfds);
                             FD_SET(fd, &readfds);
-                            timeout.tv_sec = 5;  // 5 segundos de timeout
+                            timeout.tv_sec = 5;
                             timeout.tv_usec = 0;
 
                             int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
@@ -477,23 +437,16 @@ public:
                                         lastCentralSeq = r.seq;
                                         prevHdr = r;
                                         window_size = r.wnd;
-                                        cout << "[DEBUG] Janela liberada: " << window_size 
-                                             << ", bytes em trânsito: " << bytesInFlight << "\n";
-                                        continue; // Volta ao início do loop para recalcular chunk
+                                        continue;
                                     }
                                 }
                             } else {
-                                cout << "[ERRO] Timeout aguardando liberação de janela\n";
                                 return false;
                             }
                         } else {
-                            cout << "[ERRO] Janela insuficiente e nenhum pacote pendente\n";
                             return false;
                         }
                     } else {
-                        // Ajusta chunk para caber na janela disponível
-                        cout << "[DEBUG] Ajustando fragmento de " << chunk << " para " << available_window 
-                             << " bytes (espaço disponível na janela)\n";
                         chunk = available_window;
                     }
                 }
@@ -501,24 +454,19 @@ public:
                 bool more = (off + chunk < msg.size());
                 
                 if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more)) {
-                    cout << "[ERRO] Falha ao enviar fragmento offset=" << off << "\n";
                     return false;
                 }
                     
                 off += chunk;
             }
             
-            return true; // Todos os fragmentos enviados com sucesso
+            return true;
         }
         /* --------- NÃO FRAGMENTADO --------- */
         else {
-            // Para mensagens que cabem em um único pacote
             if (msg.size() <= window_size) {
                 return enviaFragmento(msg.data(), msg.size(), 0, 0, false);
             } else {
-                // Mensagem maior que a janela, mas menor que DATA_MAX (caso raro)
-                cerr << "[ERRO] Mensagem não fragmentada excede a janela (" 
-                     << msg.size() << " > " << window_size << ")\n";
                 return false;
             }
         }
@@ -569,9 +517,7 @@ public:
         deserialize(r, rbuf);
         printHeader(r, "Pacote Recebido (REVIVE)");
 
-        // validação do bit A/R
         if (!(r.sf & FLAG_AR)) {
-            cerr << "[ERRO] Revive rejeitado pelo servidor (A/R=0)\n";
             return false;
         }
 
