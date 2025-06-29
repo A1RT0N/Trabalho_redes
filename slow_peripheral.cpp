@@ -17,6 +17,7 @@ Cauê Paiva Lira - 14675416
 #include <cctype>
 #include <algorithm>
 #include <cstdint> 
+#include <vector> 
 
 using namespace std;
 
@@ -155,6 +156,22 @@ void printHeader(const Header& h, const string& label) {
 }
 
 /**
+ * @struct PendingPacket
+ * @brief Representa um pacote pendente na fila de retransmissão.
+ */
+struct PendingPacket {
+    uint8_t  buffer[HDR_SIZE + DATA_MAX]; ///< Buffer completo do pacote
+    size_t   length;                      ///< Tamanho total do pacote
+    uint32_t seq;                         ///< Número de sequência
+    size_t   dataSize;                    ///< Tamanho dos dados (sem cabeçalho)
+    
+    PendingPacket(const uint8_t* buf, size_t len, uint32_t sequence, size_t dSize) 
+        : length(len), seq(sequence), dataSize(dSize) {
+        memcpy(buffer, buf, len);
+    }
+};
+
+/**
  * @class UDPPeripheral
  * @brief Gerencia socket UDP e implementa lógica do protocolo SLOW.
  */
@@ -170,12 +187,112 @@ private:
     uint32_t   lastCentralSeq = 0;///< Último seq do servidor
     uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
     uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
+    vector<PendingPacket> pendingQueue; ///< Fila de pacotes pendentes
+    static const int MAX_RETRIES = 3; ///< Máximo de tentativas de retransmissão
 
     uint16_t advertisedWindow() const {
         uint32_t livre = (window_size > bytesInFlight)
                         ? (window_size - bytesInFlight)
                         : 0;
         return static_cast<uint16_t>(std::min<uint32_t>(livre, UINT16_MAX));
+    }
+
+    /**
+     * @brief Remove pacotes da fila com seq <= acknum e atualiza bytesInFlight.
+     */
+    void removePendingPackets(uint32_t acknum) {
+        auto it = pendingQueue.begin();
+        while (it != pendingQueue.end()) {
+            if (it->seq <= acknum) {
+                bytesInFlight -= it->dataSize;
+                it = pendingQueue.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    /**
+     * @brief Envia um pacote com retransmissão até obter ACK.
+     * @param buf Buffer do pacote completo
+     * @param len Tamanho total do pacote  
+     * @param seq Número de sequência
+     * @param dataSize Tamanho dos dados (sem cabeçalho)
+     * @return true se ACK recebido, false em caso de erro
+     */
+    bool sendWithRetry(const uint8_t* buf, size_t len, uint32_t seq, size_t dataSize) {
+        // Adiciona à fila de pacotes pendentes
+        pendingQueue.emplace_back(buf, len, seq, dataSize);
+        bytesInFlight += dataSize;
+
+        for (int attempt = 1; attempt <= MAX_RETRIES; ++attempt) {
+            cout << "[DEBUG] Tentativa " << attempt << "/" << MAX_RETRIES 
+                 << " para seq=" << seq << "\n";
+
+            // Verifica se ainda cabe na janela atual antes de enviar
+            if (bytesInFlight > window_size) {
+                cout << "[DEBUG] Pacote não cabe na janela atual (" 
+                     << bytesInFlight << " > " << window_size << "), aguardando espaço...\n";
+                // Remove da fila e espera por ACKs para liberar espaço
+                bytesInFlight -= dataSize;
+                pendingQueue.pop_back();
+                return false;
+            }
+
+            // Envia o pacote
+            if (sendto(fd, buf, len, 0, (sockaddr*)&srv, sizeof(srv)) < 0) {
+                cerr << "[ERRO] Falha no sendto para seq=" << seq << "\n";
+                continue;
+            }
+
+            // Configura timeout para recepção
+            fd_set readfds;
+            struct timeval timeout;
+            FD_ZERO(&readfds);
+            FD_SET(fd, &readfds);
+            timeout.tv_sec = 2;  // 2 segundos de timeout
+            timeout.tv_usec = 0;
+
+            int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+            
+            if (result > 0 && FD_ISSET(fd, &readfds)) {
+                // Dados disponíveis para leitura
+                uint8_t rbuf[HDR_SIZE];
+                sockaddr_in sa;
+                socklen_t sl = sizeof(sa);
+                ssize_t recv_len = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
+                
+                if (recv_len >= HDR_SIZE) {
+                    Header r;
+                    deserialize(r, rbuf);
+                    printHeader(r, "Pacote Recebido (ACK)");
+                    
+                    if (r.sf & FLAG_ACK) {
+                        // ACK válido recebido
+                        removePendingPackets(r.ack);
+                        lastCentralSeq = r.seq;
+                        prevHdr = r;
+                        window_size = r.wnd;
+                        
+                        cout << "[DEBUG] ACK recebido para acknum=" << r.ack 
+                             << ", janela atualizada: " << window_size << "\n";
+                        return true;
+                    } else {
+                        cout << "[DEBUG] Pacote recebido não é ACK válido\n";
+                    }
+                }
+            } else if (result == 0) {
+                cout << "[DEBUG] Timeout aguardando ACK para seq=" << seq << "\n";
+            } else {
+                cerr << "[ERRO] Erro no select: " << strerror(errno) << "\n";
+            }
+        }
+
+        // Todas as tentativas falharam, remove da fila
+        cout << "[ERRO] Máximo de tentativas excedido para seq=" << seq << "\n";
+        bytesInFlight -= dataSize;
+        pendingQueue.pop_back();
+        return false;
     }
 
 public:
@@ -235,6 +352,8 @@ public:
         lastCentralSeq = r.seq;
         nextSeq        = r.seq + 1;
         window_size    = r.wnd;  // Usa o tamanho da janela informado pelo servidor
+        bytesInFlight  = 0;      // Zera bytes em trânsito
+        pendingQueue.clear();    // Limpa fila de pacotes pendentes
         cout << "[DEBUG] Janela efetiva do central: " << window_size << " (reportada: " << r.wnd << ", bytes em trânsito: " << bytesInFlight << ")\n";
         
         return true;
@@ -269,6 +388,8 @@ public:
                 printHeader(rr, "Pacote Recebido (DISCONNECT)");
                 if (rr.sf & FLAG_ACK) {
                     active = false;
+                    bytesInFlight = 0;
+                    pendingQueue.clear();
                     return true;
                 }
             }
@@ -286,10 +407,8 @@ public:
                                 uint8_t fid, uint8_t fo, bool more) -> bool {
             // Verifica se há espaço disponível na janela
             if (bytesInFlight + len > window_size) {
-                cout << "[DEBUG] Janela efetiva do central: " << window_size 
-                     << " (reportada: " << window_size << ", bytes em trânsito: " << bytesInFlight << ")\n";
-                cerr << "[ERRO] Janela do central insuficiente (" << (window_size - bytesInFlight) 
-                     << " bytes livres, tentando enviar " << len << " bytes). Aguarde ACK.\n";
+                cout << "[DEBUG] Janela insuficiente (" << (window_size - bytesInFlight) 
+                     << " bytes livres, tentando enviar " << len << " bytes)\n";
                 return false;
             }
 
@@ -308,32 +427,8 @@ public:
             cout << "PAYLOAD (" << len << " bytes): \""
                 << string(data, len < 50 ? len : 50) << (len > 50 ? "..." : "") << "\"\n\n";
 
-            bytesInFlight += len;
-            return sendto(fd, buf, HDR_SIZE + len, 0,
-                        (sockaddr*)&srv, sizeof(srv)) >= 0;
-        };
-
-        // Função para esperar o ACK e atualizar os dados de controle
-        auto esperaAck = [&]() -> bool {
-            uint8_t rbuf[HDR_SIZE];
-            sockaddr_in sa; socklen_t sl = sizeof(sa);
-            if (recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
-                return false;
-
-            Header r; deserialize(r, rbuf);
-            printHeader(r, "Pacote Recebido (ACK DATA)");
-            
-            if (!(r.sf & FLAG_ACK)) return false;
-
-            // Atualiza controle de fluxo e janela
-            bytesInFlight   = 0;
-            lastCentralSeq  = r.seq;
-            prevHdr         = r;
-            nextSeq         = lastCentralSeq + 1;
-            window_size     = r.wnd; // Atualiza a janela com o valor mais recente do servidor
-            
-            cout << "[DEBUG] Janela atualizada: " << window_size << "\n";
-            return true;
+            // Usa o novo sistema de envio com retransmissão
+            return sendWithRetry(buf, HDR_SIZE + len, h.seq, len);
         };
 
         /* --------- FRAGMENTADO --------- */
@@ -343,41 +438,83 @@ public:
             size_t  off = 0;
             
             while (off < msg.size()) {
-                // Determina o tamanho máximo que pode ser enviado nesta iteração
-                size_t chunkMax = std::min(msg.size() - off, (size_t)DATA_MAX);
-                // Limita também ao espaço disponível na janela
-                size_t chunk = std::min(chunkMax, (size_t)(window_size - bytesInFlight));
+                // Determina o tamanho do fragmento
+                size_t chunk = std::min(msg.size() - off, (size_t)DATA_MAX);
                 
-                if (chunk == 0) {
-                    // Se não há espaço na janela, espera um ACK e tenta novamente
-                    if (!esperaAck()) return false;
-                    continue; // Tenta enviar novamente após receber o ACK
+                // Ajusta chunk para caber na janela disponível
+                size_t available_window = (window_size > bytesInFlight) ? (window_size - bytesInFlight) : 0;
+                if (chunk > available_window) {
+                    if (available_window == 0) {
+                        // Não há espaço na janela, aguarda ACKs para liberar espaço
+                        cout << "[DEBUG] Aguardando espaço na janela (janela cheia: " 
+                             << bytesInFlight << "/" << window_size << ")...\n";
+                        
+                        // Se há pacotes pendentes, aguarda seus ACKs
+                        if (!pendingQueue.empty()) {
+                            // Configura timeout para recepção
+                            fd_set readfds;
+                            struct timeval timeout;
+                            FD_ZERO(&readfds);
+                            FD_SET(fd, &readfds);
+                            timeout.tv_sec = 5;  // 5 segundos de timeout
+                            timeout.tv_usec = 0;
+
+                            int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+                            
+                            if (result > 0 && FD_ISSET(fd, &readfds)) {
+                                uint8_t rbuf[HDR_SIZE];
+                                sockaddr_in sa;
+                                socklen_t sl = sizeof(sa);
+                                ssize_t recv_len = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
+                                
+                                if (recv_len >= HDR_SIZE) {
+                                    Header r;
+                                    deserialize(r, rbuf);
+                                    printHeader(r, "Pacote Recebido (ACK Fragmentação)");
+                                    
+                                    if (r.sf & FLAG_ACK) {
+                                        removePendingPackets(r.ack);
+                                        lastCentralSeq = r.seq;
+                                        prevHdr = r;
+                                        window_size = r.wnd;
+                                        cout << "[DEBUG] Janela liberada: " << window_size 
+                                             << ", bytes em trânsito: " << bytesInFlight << "\n";
+                                        continue; // Volta ao início do loop para recalcular chunk
+                                    }
+                                }
+                            } else {
+                                cout << "[ERRO] Timeout aguardando liberação de janela\n";
+                                return false;
+                            }
+                        } else {
+                            cout << "[ERRO] Janela insuficiente e nenhum pacote pendente\n";
+                            return false;
+                        }
+                    } else {
+                        // Ajusta chunk para caber na janela disponível
+                        cout << "[DEBUG] Ajustando fragmento de " << chunk << " para " << available_window 
+                             << " bytes (espaço disponível na janela)\n";
+                        chunk = available_window;
+                    }
                 }
                 
                 bool more = (off + chunk < msg.size());
                 
-                if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more))
+                if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more)) {
+                    cout << "[ERRO] Falha ao enviar fragmento offset=" << off << "\n";
                     return false;
+                }
                     
                 off += chunk;
-                
-                // Se ainda há dados para enviar e a janela está cheia, espera ACK
-                if (more && (bytesInFlight + std::min((size_t)DATA_MAX, (size_t)(msg.size() - off)) > window_size)) {
-                    if (!esperaAck()) return false;
-                }
             }
             
-            // Garantir que tenhamos o ACK final
-            return esperaAck();
+            return true; // Todos os fragmentos enviados com sucesso
         }
         /* --------- NÃO FRAGMENTADO --------- */
         else {
             // Para mensagens que cabem em um único pacote
             if (msg.size() <= window_size) {
-                if (!enviaFragmento(msg.data(), msg.size(), 0, 0, false))
-                    return false;
-                    
-                return esperaAck();
+                return enviaFragmento(msg.data(), msg.size(), 0, 0, false);
             } else {
                 // Mensagem maior que a janela, mas menor que DATA_MAX (caso raro)
                 cerr << "[ERRO] Mensagem não fragmentada excede a janela (" 
@@ -442,6 +579,8 @@ public:
         active         = true;
         lastCentralSeq = r.seq;
         nextSeq        = lastCentralSeq + 1;
+        bytesInFlight  = 0;
+        pendingQueue.clear();
 
         return true;
     }
