@@ -387,11 +387,23 @@ public:
             uint8_t buf[HDR_SIZE + DATA_MAX];
             serialize(h, buf);
             memcpy(buf + HDR_SIZE, data, len);
+            
+            // Print fragment info
+            cout << "Enviando fragmento " << (int)fo << " (FID=" << (int)fid << ", " << len << " bytes";
+            if (more) cout << ", MORE=1";
+            cout << "): \"" << string(data, std::min(len, (size_t)50));
+            if (len > 50) cout << "...";
+            cout << "\"\n";
 
             return sendWithRetry(buf, HDR_SIZE + len, h.seq, len);
         };
 
         if (msg.size() > DATA_MAX || msg.size() > window_size) {
+            cout << "Mensagem será fragmentada: " << msg.size() << " bytes (DATA_MAX=" << DATA_MAX << ", window_size=" << window_size << ")\n";
+            cout << "Conteúdo da mensagem: \"" << msg.substr(0, 100);
+            if (msg.size() > 100) cout << "...";
+            cout << "\"\n";
+            
             uint8_t fid = nextSeq & 0xFF;
             uint8_t fo  = 0;
             size_t  off = 0;
@@ -453,8 +465,13 @@ public:
                 off += chunk;
             }
             
+            cout << "Fragmentação concluída com sucesso!\n";
             return true;
         } else {
+            cout << "Enviando mensagem sem fragmentar (" << msg.size() << " bytes): \"";
+            cout << msg.substr(0, 50);
+            if (msg.size() > 50) cout << "...";
+            cout << "\"\n";
             return enviaFragmento(msg.data(), msg.size(), 0, 0, false);
         }
     }
