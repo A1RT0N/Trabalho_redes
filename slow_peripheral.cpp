@@ -253,7 +253,6 @@ private:
                 if (recv_len >= HDR_SIZE) {
                     Header r;
                     deserialize(r, rbuf);
-                    printHeader(r, "Pacote Recebido (ACK)");
                     
                     if (r.sf & FLAG_ACK) {
                         removePendingPackets(r.ack);
@@ -377,10 +376,6 @@ public:
 
         auto enviaFragmento = [&](const char* data, size_t len,
                                 uint8_t fid, uint8_t fo, bool more) -> bool {
-            if (bytesInFlight + len > window_size) {
-                return false;
-            }
-
             Header h = prevHdr;
             h.seq = nextSeq++;
             h.ack = lastCentralSeq;
@@ -392,65 +387,63 @@ public:
             uint8_t buf[HDR_SIZE + DATA_MAX];
             serialize(h, buf);
             memcpy(buf + HDR_SIZE, data, len);
-            printHeader(h, "Pacote Enviado (DATA)");
-            cout << "PAYLOAD (" << len << " bytes): \""
-                << string(data, len < 50 ? len : 50) << (len > 50 ? "..." : "") << "\"\n\n";
 
             return sendWithRetry(buf, HDR_SIZE + len, h.seq, len);
         };
 
-        /* --------- FRAGMENTADO --------- */
-        if (msg.size() > DATA_MAX) {
+        if (msg.size() > DATA_MAX || msg.size() > window_size) {
             uint8_t fid = nextSeq & 0xFF;
             uint8_t fo  = 0;
             size_t  off = 0;
             
             while (off < msg.size()) {
-                size_t chunk = std::min(msg.size() - off, (size_t)DATA_MAX);
+                size_t remaining = msg.size() - off;
+                size_t maxChunk = std::min(remaining, (size_t)DATA_MAX);
                 
-                size_t available_window = (window_size > bytesInFlight) ? (window_size - bytesInFlight) : 0;
-                if (chunk > available_window) {
-                    if (available_window == 0) {
-                        if (!pendingQueue.empty()) {
-                            fd_set readfds;
-                            struct timeval timeout;
-                            FD_ZERO(&readfds);
-                            FD_SET(fd, &readfds);
-                            timeout.tv_sec = 5;
-                            timeout.tv_usec = 0;
+                size_t available = (window_size > bytesInFlight) ? (window_size - bytesInFlight) : 0;
+                
+                while (available < maxChunk) {
+                    if (!pendingQueue.empty()) {
+                        fd_set readfds;
+                        struct timeval timeout;
+                        FD_ZERO(&readfds);
+                        FD_SET(fd, &readfds);
+                        timeout.tv_sec = 5;
+                        timeout.tv_usec = 0;
 
-                            int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+                        int result = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+                        
+                        if (result > 0 && FD_ISSET(fd, &readfds)) {
+                            uint8_t rbuf[HDR_SIZE];
+                            sockaddr_in sa;
+                            socklen_t sl = sizeof(sa);
+                            ssize_t recv_len = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
                             
-                            if (result > 0 && FD_ISSET(fd, &readfds)) {
-                                uint8_t rbuf[HDR_SIZE];
-                                sockaddr_in sa;
-                                socklen_t sl = sizeof(sa);
-                                ssize_t recv_len = recvfrom(fd, rbuf, HDR_SIZE, 0, (sockaddr*)&sa, &sl);
+                            if (recv_len >= HDR_SIZE) {
+                                Header r;
+                                deserialize(r, rbuf);
                                 
-                                if (recv_len >= HDR_SIZE) {
-                                    Header r;
-                                    deserialize(r, rbuf);
-                                    printHeader(r, "Pacote Recebido (ACK Fragmentação)");
-                                    
-                                    if (r.sf & FLAG_ACK) {
-                                        removePendingPackets(r.ack);
-                                        lastCentralSeq = r.seq;
-                                        prevHdr = r;
-                                        window_size = r.wnd;
-                                        continue;
-                                    }
+                                if (r.sf & FLAG_ACK) {
+                                    removePendingPackets(r.ack);
+                                    lastCentralSeq = r.seq;
+                                    prevHdr = r;
+                                    window_size = r.wnd;
+                                    available = (window_size > bytesInFlight) ? (window_size - bytesInFlight) : 0;
                                 }
-                            } else {
-                                return false;
                             }
                         } else {
                             return false;
                         }
                     } else {
-                        chunk = available_window;
+                        if (available == 0) {
+                            return false;
+                        }
+                        maxChunk = available;
+                        break;
                     }
                 }
                 
+                size_t chunk = std::min(maxChunk, available);
                 bool more = (off + chunk < msg.size());
                 
                 if (!enviaFragmento(msg.data() + off, chunk, fid, fo++, more)) {
@@ -461,14 +454,8 @@ public:
             }
             
             return true;
-        }
-        /* --------- NÃO FRAGMENTADO --------- */
-        else {
-            if (msg.size() <= window_size) {
-                return enviaFragmento(msg.data(), msg.size(), 0, 0, false);
-            } else {
-                return false;
-            }
+        } else {
+            return enviaFragmento(msg.data(), msg.size(), 0, 0, false);
         }
     }
 
