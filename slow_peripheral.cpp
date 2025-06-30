@@ -185,6 +185,11 @@ private:
     bool       hasPrev   = false; ///< Replay possível?
     uint32_t   nextSeq   = 0;     ///< Próximo sequence number
     uint32_t   lastCentralSeq = 0;///< Último seq do servidor
+    
+    // Estados salvos para revive (capturados no disconnect)
+    uint32_t   savedNextSeq = 0;     ///< nextSeq correto para revive
+    uint32_t   savedCentralSeq = 0;  ///< lastCentralSeq correto para revive
+    
     uint32_t   window_size    = 5 * DATA_MAX; ///< Tamanho inicial da janela
     uint32_t   bytesInFlight  = 0; ///< Bytes enviados aguardando ACK
     vector<PendingPacket> pendingQueue; ///< Fila de pacotes pendentes
@@ -355,7 +360,8 @@ public:
         if (!active) return false;
 
         Header h = prevHdr;
-        h.seq = nextSeq++;
+        uint32_t disconnectSeq = nextSeq++;
+        h.seq = disconnectSeq;
         h.ack = lastCentralSeq;
         h.wnd = 0;
         h.sf  = (h.sf & ~0x1F) | FLAG_C | FLAG_R | FLAG_ACK;
@@ -376,6 +382,10 @@ public:
                 Header rr; deserialize(rr, rbuf);
                 printHeader(rr, "Pacote Recebido (DISCONNECT)");
                 if (rr.sf & FLAG_ACK) {
+                    // Salva o estado correto para revive futuro
+                    savedNextSeq = nextSeq;        // Próximo seq após disconnect
+                    savedCentralSeq = rr.seq;      // Último seq do servidor
+                    
                     active = false;
                     bytesInFlight = 0;
                     pendingQueue.clear();
@@ -501,6 +511,8 @@ public:
     void storeSession() {
         if (active) {
             lastHdr = prevHdr;
+            savedNextSeq = nextSeq;
+            savedCentralSeq = lastCentralSeq;
             hasPrev = true;
         }
     }
@@ -516,16 +528,18 @@ public:
     bool zeroWay(const string& msg) {
         if (!hasPrev) return false;
 
+        static int revive_attempt = 0;
+        revive_attempt++;
+
         Header h = lastHdr;
-        h.seq = nextSeq++;
-        h.ack = lastCentralSeq;
+        h.seq = savedNextSeq;        // Usa o seq correto salvo no disconnect
+        h.ack = savedCentralSeq;     // Usa o central seq correto salvo no disconnect
         h.wnd = window_size;
         h.sf  = (h.sf & ~0x1F) | FLAG_R | FLAG_ACK;
 
         uint8_t buf[HDR_SIZE + DATA_MAX];
         serialize(h, buf);
         memcpy(buf + HDR_SIZE, msg.data(), msg.size());
-        printHeader(h, "Pacote Enviado (REVIVE)");
 
         if (sendto(fd, buf, HDR_SIZE + msg.size(), 0, (sockaddr*)&srv, sizeof(srv)) < 0)
             return false;
@@ -537,19 +551,23 @@ public:
 
         Header r;
         deserialize(r, rbuf);
-        printHeader(r, "Pacote Recebido (REVIVE)");
 
         if (!(r.sf & FLAG_AR)) {
+            // Se é a primeira tentativa, tenta novamente
+            if (revive_attempt == 1) {
+                usleep(200000); // 200ms de delay
+                return zeroWay(msg); // retry automático - uma única vez
+            }
             return false;
         }
 
         prevHdr        = r;
         active         = true;
         lastCentralSeq = r.seq;
-        nextSeq        = lastCentralSeq + 1;
+        nextSeq        = savedNextSeq + 1; // próximo após o seq usado no revive
         bytesInFlight  = 0;
         pendingQueue.clear();
-
+        revive_attempt = 0;
         return true;
     }
 };
