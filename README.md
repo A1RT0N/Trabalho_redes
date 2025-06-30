@@ -17,8 +17,6 @@ Esta nova versão do *peripheral* SLOW expande a implementação original com:
 | **Logs detalhados**                    | Função `printHeader()` exibe cada campo do cabeçalho; mensagens **DEBUG** mostram a “janela efetiva” antes de cada envio.                                                         |
 | **Menu interativo revisado**           | Mesmo conjunto de comandos, mas com avisos/erros mais claros e mensagens de ajuda formatadas em box-drawing.                                                                      |
 
----
-
 ## Pré-requisitos
 
 * Compilador **C++17**
@@ -26,8 +24,6 @@ Esta nova versão do *peripheral* SLOW expande a implementação original com:
 * Sistema **POSIX** (Linux/macOS). Testado em Ubuntu 22.04
 * **Make** (GNU Make)
 * Permissão para criar sockets UDP na porta de origem aleatória
-
----
 
 ## Compilação
 
@@ -48,8 +44,6 @@ Gera o binário `slow_peripheral`.
 make run           
 ```
 
----
-
 ## Menu de comandos
 
 | Comando        | Alias            | Função                                                                        |
@@ -60,8 +54,6 @@ make run
 | **status**     | `4`              | Exibe host, estado da conexão e disponibilidade de *revive*                   |
 | **help**       | `5`              | Mostra explicação dos comandos                                                |
 | **exit**       | `6` `quit` `end` | Desconecta (se necessário) e finaliza o cliente                               |
-
----
 
 ## Exemplo de sessão
 
@@ -107,8 +99,6 @@ Digite uma mensagem para enviar com o revive: Olá de novo!
 > exit
 Até logo!
 ```
-
----
 
 ## Estrutura do código-fonte
 
