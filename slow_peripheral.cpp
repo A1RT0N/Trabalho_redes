@@ -294,40 +294,58 @@ public:
     }
 
     /**
-     * @brief Realiza handshake CONNECT→SETUP→ACK.
+     * @brief Realiza handshake inicial com o servidor (3-way handshake).
      */
     bool connect() {
+
+        // PASSO 1: Envia CONNECT
         Header h;
         h.seq = nextSeq++;
-        h.wnd = advertisedWindow();
-        h.sf |= FLAG_C;
+        h.wnd = advertisedWindow(); // janela atual
+        h.sf |= FLAG_C; // flag connect
 
         uint8_t buf[HDR_SIZE];
         serialize(h, buf);
-        printHeader(h, "Pacote Enviado (CONNECT)");
+        printHeader(h, "Enviado - CONNECT (1/3)");
         if (sendto(fd, buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
-            return false;
+            return false; 
 
+        // PASSO 2: Aguarda SETUP do servidor
         uint8_t rbuf[HDR_SIZE + DATA_MAX];
         sockaddr_in sa; socklen_t sl = sizeof(sa);
         if (recvfrom(fd, rbuf, sizeof(rbuf), 0, (sockaddr*)&sa, &sl) < HDR_SIZE)
             return false;
 
-        Header r; deserialize(r, rbuf);
-        printHeader(r, "Pacote Recebido (SETUP)");
-        if (r.ack != 0 || !(r.sf & FLAG_AR))
+        Header r;
+        deserialize(r, rbuf);
+        printHeader(r, "Recebido - SETUP (2/3)");
+
+        if (r.ack != h.seq || !(r.sf & FLAG_AR)) return false; // verifica se ACK confirma nosso CONNECT
+        
+        // PASSO 3: Envia ACK final para completar 3-way handshake
+        Header ack_final;
+        ack_final.sid = r.sid; // usar o SID do servidor
+        ack_final.seq = nextSeq++;
+        ack_final.ack = r.seq; // confirma o SETUP do servidor
+        ack_final.wnd = advertisedWindow();
+        ack_final.sf = FLAG_ACK; // apenas flag ACK
+
+        uint8_t ack_buf[HDR_SIZE];
+        serialize(ack_final, ack_buf);
+        printHeader(ack_final, "Enviado - ACK (3/3)");
+        if (sendto(fd, ack_buf, HDR_SIZE, 0, (sockaddr*)&srv, sizeof(srv)) < HDR_SIZE)
             return false;
 
-        prevHdr        = r;
-        hasPrev        = true;
-        active         = true;
+        // ajusta estado interno
+        prevHdr = r;
+        active = hasPrev = true; // sessão ativa e com histórico para revive
         lastCentralSeq = r.seq;
-        nextSeq        = r.seq + 1;
-        window_size    = r.wnd;
-        bytesInFlight  = 0;
+        nextSeq = r.seq + 1;
+        window_size = r.wnd; // tamanho da janela do servidor
+        bytesInFlight = 0;
         pendingQueue.clear();
-        
-        return true;
+
+        return true; // 3-way handshake bem sucedido
     }
 
     /**
