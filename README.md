@@ -3,8 +3,6 @@
 **Autores**
 Ayrton da Costa Ganem Filho (14560190) · Luiz Felipe Diniz Costa (13782032) · Cauê Paiva Lira (14675416)
 
----
-
 ## Visão geral
 
 Esta nova versão do *peripheral* SLOW expande a implementação original com:
